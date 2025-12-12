@@ -6,7 +6,7 @@ import torch
 from gym import spaces
 from typing import List, Tuple, Dict
 from datetime import timedelta
-from dataloader import DataLoader, DataLoaderFactory
+from dataloader import DataLoaderFactory
 from params_config import Config
 from charging_entities import MCS, MCSStatus, FCS, ChargingRequest, ChargingPile
 from distance import haversine_distance
@@ -838,3 +838,6 @@ class EdgeEnv(gym.Env):
             count += len(current_waits)
 
         return total_wait / count if count > 0 else 0.0
+
+    def _extract_point_features(self):
+        pass
