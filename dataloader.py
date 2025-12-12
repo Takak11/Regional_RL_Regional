@@ -272,14 +272,6 @@ class DataLoaderFactory:
                  trajectory_file: str,
                  region_file: str,
                  dispatch_file: str):
-        """
-        初始化工厂
-
-        Args:
-            trajectory_file: 轨迹文件路径
-            region_file: 区域文件路径
-            dispatch_file: 调度点文件路径
-        """
         print("初始化数据加载器工厂...")
 
         # 创建共享的管理器(这些是只读的,可以共享)
