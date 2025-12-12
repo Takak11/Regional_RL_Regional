@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 from torch.utils.tensorboard import SummaryWriter
 
-from dataloader import DataLoader
+from dataloader import DataLoaderFactory
 from params_config import Config
 from edge_env import EdgeEnv
 
@@ -490,6 +490,17 @@ class ImprovedDQNAgent:
             self.reward_normalizer.count = checkpoint['reward_normalizer']['count']
 
 
+def set_global_seeds(seed: int):
+    """Set global random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def train_improved_dqn(
         trajectory_file: str,
         region_file: str,
@@ -508,12 +519,13 @@ def train_improved_dqn(
         epsilon_decay: int = 10000,
         target_update_freq: int = 100,
         save_freq: int = 100,
-        state_dim: int = 128,
+        state_dim: int = None,
         use_double_dqn: bool = True,
         use_prioritized_replay: bool = True,
         use_reward_norm: bool = True,
         log_dir: str = './logs',
-        model_dir: str = './models'
+        model_dir: str = './models',
+        seed: int = config.random_seed
 ):
     """
     改进的DQN训练主函数 - 带进度条和详细统计
@@ -522,32 +534,39 @@ def train_improved_dqn(
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
+    # 统一设置随机种子
+    if seed is not None:
+        set_global_seeds(seed)
+
     # 初始化TensorBoard
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     writer = SummaryWriter(os.path.join(log_dir, f'run_{timestamp}'))
 
-    # 初始化数据加载器
-    print("初始化数据加载器...")
-    data_loader = DataLoader(
+    # 初始化数据工厂并创建数据加载器
+    print("初始化数据加载器工厂...")
+    factory = DataLoaderFactory(
         trajectory_file=trajectory_file,
         region_file=region_file,
-        dispatch_points_file=dispatch_points_file
+        dispatch_file=dispatch_points_file
     )
 
     # 创建环境
     print(f"创建区域 {region_id} 的环境...")
     env = EdgeEnv(
         region_id=region_id,
-        data_loader=data_loader,
-        max_steps=max_steps,
-        state_dim=state_dim,
-        matching_method='hungarian'
+        factory=factory,
+        max_steps=max_steps
     )
+    if seed is not None:
+        env.seed(seed)
+
+    # 根据环境的观测空间确定状态维度，避免手动配置失配
+    resolved_state_dim = env.observation_space.shape[0]
 
     # 创建智能体
     print("创建改进的DQN智能体...")
     agent = ImprovedDQNAgent(
-        state_dim=state_dim,
+        state_dim=resolved_state_dim,
         max_action_dim=env.num_dispatch_points,
         lr=lr,
         gamma=gamma,

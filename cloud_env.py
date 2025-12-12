@@ -26,6 +26,7 @@ class CloudSchedulerEnv(gym.Env):
         self.max_steps = max_steps
         self.max_mcs_per_region = max_mcs_per_region
         self.initial_mcs_per_region = config.MCS_PER_REGION
+        self.min_mcs_per_region = max(1, self.initial_mcs_per_region // 2)
         factory = DataLoaderFactory(
             trajectory_file='dataset/top1000evs/reallocated/20140818_processed.csv',
             region_file='dataset/fcs_voronoi_regions.geojson',
@@ -43,14 +44,6 @@ class CloudSchedulerEnv(gym.Env):
         self.mcs_pool = {}  # {mcs_id: MCS对象}
         self.region_mcs_mapping = defaultdict(list)  # {region_id: [mcs_ids]}
         self._initialize_mcs_pool()
-
-        # 观察空间: 每个区域的统计信息 + 全局信息
-        # 每个区域: [pending_requests, idle_mcs, fcs_load, avg_wait_time, mcs_count]
-        self.obs_dim = num_regions * 5 + 10  # 区域信息 + 全局统计
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(self.obs_dim,), dtype=np.float32
-        )
 
         # 动作空间: 为每对区域决定调度MCS的数量
         # 使用连续动作空间,输出调度矩阵的logits
@@ -77,6 +70,14 @@ class CloudSchedulerEnv(gym.Env):
 
         self.np_random = None
         self.seed()
+
+        # 观察空间: 与实际状态长度对齐，避免特征变动导致维度异常
+        initial_obs = self._get_obs()
+        self.obs_dim = initial_obs.shape[0]
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.obs_dim,), dtype=np.float32
+        )
 
     def seed(self, seed=config.random_seed):
         if seed is None:
@@ -127,6 +128,47 @@ class CloudSchedulerEnv(gym.Env):
             'avg_wait': avg_wait
         }
 
+    def _compute_target_distribution(self) -> np.ndarray:
+        """根据需求强度推导目标MCS分布"""
+        stats = [self._get_region_stats(r) for r in range(self.num_regions)]
+        pending = np.array([s['pending'] for s in stats], dtype=float)
+
+        # 基础保障: 每个区域至少保留一定数量的MCS
+        base_allocation = np.ones(self.num_regions, dtype=float) * self.min_mcs_per_region
+        remaining = len(self.mcs_pool) - base_allocation.sum()
+
+        if remaining > 0 and pending.sum() > 0:
+            demand_share = pending / pending.sum()
+            dynamic_allocation = np.round(remaining * demand_share)
+        else:
+            dynamic_allocation = np.zeros(self.num_regions, dtype=float)
+
+        target = base_allocation + dynamic_allocation
+        target = np.clip(target, self.min_mcs_per_region, self.max_mcs_per_region)
+
+        # 调整总量以匹配现有MCS数量
+        diff = len(self.mcs_pool) - target.sum()
+        if diff > 0:
+            # 将多余的平均分配到需求高的区域
+            demand_order = np.argsort(-pending)
+            for idx in demand_order:
+                if diff <= 0:
+                    break
+                if target[idx] < self.max_mcs_per_region:
+                    target[idx] += 1
+                    diff -= 1
+        elif diff < 0:
+            # 需要回收部分
+            release_order = np.argsort(pending)
+            for idx in release_order:
+                if diff >= 0:
+                    break
+                if target[idx] > self.min_mcs_per_region:
+                    target[idx] -= 1
+                    diff += 1
+
+        return target.astype(int)
+
     def _get_obs(self) -> np.ndarray:
         """获取全局观察"""
         obs_parts = []
@@ -174,7 +216,15 @@ class CloudSchedulerEnv(gym.Env):
 
         obs_parts.extend(global_features)
 
-        return np.array(obs_parts, dtype=np.float32)
+        obs_array = np.array(obs_parts, dtype=np.float32)
+
+        # 防御性检查: 保证观测维度与声明的observation_space一致
+        if hasattr(self, 'obs_dim') and obs_array.shape[0] != self.obs_dim:
+            raise ValueError(
+                f"Observation dimension mismatch: expected {self.obs_dim}, got {obs_array.shape[0]}"
+            )
+
+        return obs_array
 
     def _parse_action(self, action: np.ndarray) -> Dict[Tuple[int, int], int]:
         """解析动作为调度决策
@@ -182,6 +232,7 @@ class CloudSchedulerEnv(gym.Env):
         Returns:
             {(source_region, target_region): num_mcs}
         """
+        target_distribution = self._compute_target_distribution()
         # 将action reshape为调度矩阵
         dispatch_logits = action.reshape(self.num_regions, self.num_regions)
 
@@ -194,7 +245,11 @@ class CloudSchedulerEnv(gym.Env):
                 mcs_id for mcs_id in self.region_mcs_mapping[source]
                 if self.mcs_pool[mcs_id].status == MCSStatus.IDLE
             ]
-            available = len(idle_mcs_ids)
+            current_total = len(self.region_mcs_mapping[source])
+            # 保留保障容量,禁止把区域抽干
+            retention_quota = max(self.min_mcs_per_region, target_distribution[source])
+            max_transferable = max(current_total - retention_quota, 0)
+            available = min(len(idle_mcs_ids), max_transferable)
 
             if available == 0:
                 continue
@@ -214,13 +269,15 @@ class CloudSchedulerEnv(gym.Env):
                     continue
 
                 target_stats = self._get_region_stats(target)
+                target_deficit = max(target_distribution[target] - target_stats['mcs_count'], 0)
 
                 # 只在目标有需求且概率足够高时调度
-                if target_stats['pending'] > 0 and row_probs[target] > 0.1:
-                    # 调度数量: 考虑需求和概率
+                if target_stats['pending'] > 0 and row_probs[target] > 0.1 and target_deficit > 0:
+                    # 调度数量: 考虑需求、缺口与概率
                     demand_factor = min(target_stats['pending'] / 5.0, 1.0)
-                    num_to_dispatch = int(available * row_probs[target] * demand_factor)
-                    num_to_dispatch = min(num_to_dispatch, available, 2)  # 限制单次最多2个
+                    rebalancing_weight = min(target_deficit / self.max_mcs_per_region, 1.0)
+                    num_to_dispatch = int(available * row_probs[target] * demand_factor * (0.5 + 0.5 * rebalancing_weight))
+                    num_to_dispatch = min(num_to_dispatch, available, target_deficit, 2)  # 限制单次最多2个
 
                     if num_to_dispatch > 0:
                         dispatch_matrix[source, target] = num_to_dispatch
@@ -349,11 +406,16 @@ class CloudSchedulerEnv(gym.Env):
 
         # 1. 负载均衡奖励
         region_stats = [self._get_region_stats(r) for r in range(self.num_regions)]
+        target_distribution = self._compute_target_distribution()
 
         # MCS分布均衡性
         mcs_counts = [s['mcs_count'] for s in region_stats]
         mcs_std = np.std(mcs_counts)
         mcs_balance_reward = -mcs_std * 0.1
+
+        # 目标分布偏差惩罚
+        distribution_gap = np.abs(target_distribution - mcs_counts)
+        distribution_penalty = -0.05 * distribution_gap.mean()
 
         # 需求-资源匹配度
         for stats in region_stats:
@@ -382,7 +444,7 @@ class CloudSchedulerEnv(gym.Env):
         distance_penalty = recent_distance * 0.01
 
         # 4. 组合奖励
-        total_cloud_reward = reward + mcs_balance_reward - distance_penalty
+        total_cloud_reward = reward + mcs_balance_reward + distribution_penalty - distance_penalty
 
         return np.clip(total_cloud_reward, -2.0, 2.0)
 
