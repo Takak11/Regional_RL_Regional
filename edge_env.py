@@ -5,6 +5,7 @@ import random
 import torch
 from gym import spaces
 from typing import List, Tuple, Dict
+from dataclasses import dataclass
 from datetime import timedelta
 from dataloader import DataLoaderFactory
 from params_config import Config
@@ -12,6 +13,13 @@ from charging_entities import MCS, MCSStatus, FCS, ChargingRequest, ChargingPile
 from distance import haversine_distance
 
 config = Config()
+
+
+@dataclass
+class PointFeatureResult:
+    """调度点特征提取的结果容器。"""
+
+    reachable_indices: List[int]
 
 
 class MCSMatcher:
@@ -322,6 +330,18 @@ class EdgeEnv(gym.Env):
         # 归一化到 [0,1]
         heatmap = heatmap / np.max(heatmap)
         return heatmap.flatten().tolist()
+
+    def _extract_point_features(self) -> PointFeatureResult:
+        """提取当前可调度的调度点索引，用于构建动作可达掩码。"""
+
+        reachable_indices = set()
+
+        for mcs in self.mcs_list:
+            if mcs.status == MCSStatus.IDLE:
+                reachable = self.matcher._get_reachable_points(mcs, self.dispatch_points)
+                reachable_indices.update(reachable)
+
+        return PointFeatureResult(reachable_indices=sorted(reachable_indices))
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
