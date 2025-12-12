@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 from torch.utils.tensorboard import SummaryWriter
 
-from dataloader import DataLoader
+from dataloader import DataLoaderFactory
 from params_config import Config
 from edge_env import EdgeEnv
 
@@ -19,6 +19,64 @@ config = Config()
 
 # 经验回放缓冲区
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'reachable_mask'))
+
+
+def run_policy_evaluation(env: 'EdgeEnv', agent: 'ImprovedDQNAgent', max_steps: int,
+                          episodes: int, eval_epsilon: float) -> tuple:
+    """使用近乎贪心策略评估当前智能体，减少训练探索噪声对成功率的影响"""
+    eval_rewards = []
+    eval_success_rates = []
+    eval_wait_times = []
+
+    original_epsilon = agent.epsilon
+    agent.epsilon = eval_epsilon
+
+    try:
+        for _ in range(episodes):
+            state = env.reset()
+            episode_reward = 0.0
+
+            for _ in range(max_steps):
+                point_result = env._extract_point_features()
+                reachable_indices = point_result.reachable_indices
+
+                reachable_mask = np.zeros(env.num_dispatch_points, dtype=bool)
+                if len(reachable_indices) > 0:
+                    reachable_mask[reachable_indices] = True
+
+                action = agent.select_action(state, reachable_mask, epsilon=eval_epsilon)
+
+                next_state, reward, done, info = env.step(action)
+                state = next_state
+                episode_reward += reward
+
+                if done:
+                    break
+
+            stats = info['episode_stats']
+            served = stats.get('served_requests', 0)
+            failed = stats.get('failed_requests', 0)
+            pending = info.get('pending_requests', 0)
+            total_requests = served + failed + pending
+            success_rate = (served / total_requests * 100) if total_requests > 0 else 0.0
+
+            if stats.get('wait_time_count', 0) > 0:
+                avg_wait_time = stats['total_wait_time'] / stats['wait_time_count']
+            else:
+                avg_wait_time = 0.0
+
+            eval_rewards.append(episode_reward)
+            eval_success_rates.append(success_rate)
+            eval_wait_times.append(avg_wait_time)
+    finally:
+        # 恢复训练时的探索率
+        agent.epsilon = original_epsilon
+
+    mean_success = float(np.mean(eval_success_rates)) if eval_success_rates else 0.0
+    mean_reward = float(np.mean(eval_rewards)) if eval_rewards else 0.0
+    mean_wait = float(np.mean(eval_wait_times)) if eval_wait_times else 0.0
+
+    return mean_success, mean_reward, mean_wait
 
 
 class OptimalPointTracker:
@@ -490,6 +548,17 @@ class ImprovedDQNAgent:
             self.reward_normalizer.count = checkpoint['reward_normalizer']['count']
 
 
+def set_global_seeds(seed: int):
+    """Set global random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def train_improved_dqn(
         trajectory_file: str,
         region_file: str,
@@ -508,12 +577,16 @@ def train_improved_dqn(
         epsilon_decay: int = 10000,
         target_update_freq: int = 100,
         save_freq: int = 100,
-        state_dim: int = 128,
+        eval_interval: int = 50,
+        eval_episodes: int = 3,
+        eval_epsilon: float = 0.05,
+        state_dim: int = None,
         use_double_dqn: bool = True,
         use_prioritized_replay: bool = True,
         use_reward_norm: bool = True,
         log_dir: str = './logs',
-        model_dir: str = './models'
+        model_dir: str = './models',
+        seed: int = config.random_seed
 ):
     """
     改进的DQN训练主函数 - 带进度条和详细统计
@@ -522,32 +595,39 @@ def train_improved_dqn(
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
+    # 统一设置随机种子
+    if seed is not None:
+        set_global_seeds(seed)
+
     # 初始化TensorBoard
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     writer = SummaryWriter(os.path.join(log_dir, f'run_{timestamp}'))
 
-    # 初始化数据加载器
-    print("初始化数据加载器...")
-    data_loader = DataLoader(
+    # 初始化数据工厂并创建数据加载器
+    print("初始化数据加载器工厂...")
+    factory = DataLoaderFactory(
         trajectory_file=trajectory_file,
         region_file=region_file,
-        dispatch_points_file=dispatch_points_file
+        dispatch_file=dispatch_points_file
     )
 
     # 创建环境
     print(f"创建区域 {region_id} 的环境...")
     env = EdgeEnv(
         region_id=region_id,
-        data_loader=data_loader,
-        max_steps=max_steps,
-        state_dim=state_dim,
-        matching_method='hungarian'
+        factory=factory,
+        max_steps=max_steps
     )
+    if seed is not None:
+        env.seed(seed)
+
+    # 根据环境的观测空间确定状态维度，避免手动配置失配
+    resolved_state_dim = env.observation_space.shape[0]
 
     # 创建智能体
     print("创建改进的DQN智能体...")
     agent = ImprovedDQNAgent(
-        state_dim=state_dim,
+        state_dim=resolved_state_dim,
         max_action_dim=env.num_dispatch_points,
         lr=lr,
         gamma=gamma,
@@ -671,7 +751,8 @@ def train_improved_dqn(
         stats = info['episode_stats']
         served = stats.get('served_requests', 0)
         failed = stats.get('failed_requests', 0)
-        total_requests = served + failed
+        pending = info.get('pending_requests', 0)
+        total_requests = served + failed + pending
         success_rate = (served / total_requests * 100) if total_requests > 0 else 0
 
         # 计算平均等待时间
@@ -738,6 +819,25 @@ def train_improved_dqn(
             q_stats = agent.get_q_stats()
             print(f"  Q值统计: μ={q_stats['mean_q']:.2f}, σ={q_stats['std_q']:.2f}")
             print("-" * 100)
+
+        # 定期评估，以平滑展示随训练进程提升的成功率
+        if episode % eval_interval == 0:
+            eval_success, eval_reward, eval_wait = run_policy_evaluation(
+                env=env,
+                agent=agent,
+                max_steps=max_steps,
+                episodes=eval_episodes,
+                eval_epsilon=eval_epsilon
+            )
+
+            writer.add_scalar('Eval/Success_Rate', eval_success, episode)
+            writer.add_scalar('Eval/Reward', eval_reward, episode)
+            writer.add_scalar('Eval/Avg_Wait_Time', eval_wait, episode)
+
+            print(
+                f"  [Eval every {eval_interval}] 成功率: {eval_success:.1f}% | "
+                f"奖励: {eval_reward:.2f} | 平均等待: {eval_wait:.2f}min"
+            )
 
     # 保存最终模型
     print()  # 换行
