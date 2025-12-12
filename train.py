@@ -11,7 +11,7 @@ from datetime import datetime
 import json
 from torch.utils.tensorboard import SummaryWriter
 
-from dataloader import DataLoader
+from dataloader import DataLoaderFactory
 from params_config import Config
 from edge_env import EdgeEnv
 
@@ -526,22 +526,20 @@ def train_improved_dqn(
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     writer = SummaryWriter(os.path.join(log_dir, f'run_{timestamp}'))
 
-    # 初始化数据加载器
-    print("初始化数据加载器...")
-    data_loader = DataLoader(
+    # 初始化数据工厂并创建数据加载器
+    print("初始化数据加载器工厂...")
+    factory = DataLoaderFactory(
         trajectory_file=trajectory_file,
         region_file=region_file,
-        dispatch_points_file=dispatch_points_file
+        dispatch_file=dispatch_points_file
     )
 
     # 创建环境
     print(f"创建区域 {region_id} 的环境...")
     env = EdgeEnv(
         region_id=region_id,
-        data_loader=data_loader,
-        max_steps=max_steps,
-        state_dim=state_dim,
-        matching_method='hungarian'
+        factory=factory,
+        max_steps=max_steps
     )
 
     # 创建智能体

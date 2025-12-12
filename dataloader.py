@@ -127,25 +127,16 @@ class DataLoader:
     """独立的数据加载器 - 每个edge_env使用独立实例"""
 
     def __init__(self,
-                 trajectory_file: str,
-                 region_file: str,
-                 dispatch_file: str,
+                 trajectory_df: pd.DataFrame,
                  soc_manager: SOCManager,
                  region_manager: RegionManager,
                  dispatch_manager: DispatchPointManager):
-        self.trajectory_file = trajectory_file
         self.soc_manager = soc_manager
         self.region_manager = region_manager
         self.dispatch_manager = dispatch_manager
 
-        # 加载轨迹数据
-        self.trajectory_df = pd.read_csv(trajectory_file)
-        self.trajectory_df['timestamp'] = pd.to_datetime(
-            self.trajectory_df['timestamp']
-        )
-        self.trajectory_df = self.trajectory_df.sort_values(
-            ['id', 'timestamp']
-        ).reset_index(drop=True)
+        # 复用预处理后的轨迹数据(必要时在工厂中创建拷贝)
+        self.trajectory_df = trajectory_df
 
         # 当前时间索引(每个实例独立)
         self.current_time_index = 0
@@ -309,14 +300,46 @@ class DataLoaderFactory:
         self.region_file = region_file
         self.dispatch_file = dispatch_file
 
+        # 预处理并缓存轨迹数据
+        print("  预处理轨迹数据...")
+        self.trajectory_df = self._load_and_cache_trajectory()
+
         print("数据加载器工厂初始化完成!")
+
+    def _load_and_cache_trajectory(self) -> pd.DataFrame:
+        """加载、解析并缓存轨迹数据"""
+        cache_path = os.path.splitext(self.trajectory_file)[0] + '.feather'
+
+        if os.path.exists(cache_path):
+            try:
+                df = pd.read_feather(cache_path)
+            except Exception as e:
+                print(f"  警告: 无法读取Feather缓存({e})，回退到CSV加载")
+                df = None
+        else:
+            df = None
+
+        if df is None:
+            df = pd.read_csv(self.trajectory_file)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values(['id', 'timestamp']).reset_index(drop=True)
+
+            try:
+                df.to_feather(cache_path)
+            except Exception as e:
+                print(f"  警告: 无法写入Feather缓存({e})，将使用内存缓存")
+
+        # 确保时间戳为datetime类型且排序正确
+        if not np.issubdtype(df['timestamp'].dtype, np.datetime64):
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        df = df.sort_values(['id', 'timestamp']).reset_index(drop=True)
+        return df
 
     def create_dataloader(self) -> DataLoader:
         """创建新的独立DataLoader实例"""
         return DataLoader(
-            self.trajectory_file,
-            self.region_file,
-            self.dispatch_file,
+            self.trajectory_df.copy(deep=True),
             self.soc_manager,
             self.region_manager,
             self.dispatch_manager
