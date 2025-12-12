@@ -125,16 +125,12 @@ class EdgeEnv(gym.Env):
         self._last_failed = 0
         self.matcher = MCSMatcher()
 
-        # 观察空间: 简化状态向量
-        # [MCS状态(num_mcs*3), 请求热力图(grid_size*grid_size), 全局统计(5)]
+        # 区域边界用于请求热力图
+        self.region_bounds = self._get_region_bounds()
+
+        # 观察空间: 在第一次 reset 后根据实际状态长度确定
         self.grid_size = 10  # 网格大小
-        state_dim = self.num_mcs * 3 + self.grid_size * self.grid_size + 5
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(state_dim,),
-            dtype=np.float32
-        )
+        self.observation_space = None
 
         # 初始化时间
         dataset_start = self.data_loader.get_current_time()
@@ -174,6 +170,16 @@ class EdgeEnv(gym.Env):
         self.training_progress = 0.0  # 0.0 到 1.0
 
         self.reset()
+
+        # 在 reset 后补充 observation_space（依赖初始化后的状态长度）
+        if self.observation_space is None:
+            initial_obs = self._get_obs()
+            self.observation_space = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=initial_obs.shape,
+                dtype=np.float32
+            )
 
     def seed(self, seed=config.random_seed):
         """与 Gym 兼容的种子函数"""
@@ -216,6 +222,23 @@ class EdgeEnv(gym.Env):
             mcs_list.append(mcs)
         return mcs_list
 
+    def _get_region_bounds(self) -> Tuple[float, float, float, float]:
+        """获取区域边界(最小经度、最小纬度、最大经度、最大纬度)"""
+        polygon = self.data_loader.region_manager.get_region_polygon(self.region_id)
+        if polygon is not None:
+            minx, miny, maxx, maxy = polygon.bounds
+            return minx, miny, maxx, maxy
+
+        # 无法获取多边形时，基于调度点或区域中心兜底
+        if self.dispatch_points:
+            lons = [p['longitude'] for p in self.dispatch_points]
+            lats = [p['latitude'] for p in self.dispatch_points]
+            return min(lons), min(lats), max(lons), max(lats)
+
+        center_lon, center_lat = self.data_loader.get_region_center(self.region_id)
+        delta = 0.01
+        return center_lon - delta, center_lat - delta, center_lon + delta, center_lat + delta
+
     def _get_obs(self) -> np.ndarray:
         """获取简化的观察状态"""
         obs_parts = []
@@ -241,6 +264,10 @@ class EdgeEnv(gym.Env):
         obs_parts.extend([fcs_available_piles / len(self.fcs.charging_piles),
                           fcs_queuing_length / config.EXPECTED_MAX_QUEUING_LENGTH,
                           avg_fcs_wait / config.EXPECTED_MAX_FCS_WAIT_TIME])
+
+        # 请求热力图 (grid_size x grid_size)
+        heatmap = self._build_request_heatmap()
+        obs_parts.extend(heatmap)
 
         # 区域级负载与需求状态 未服务请求数 平均等待时间
         num_pending = len(self.pending_requests)
@@ -271,6 +298,30 @@ class EdgeEnv(gym.Env):
         obs_parts.extend(global_stats)
 
         return np.array(obs_parts, dtype=np.float32)
+
+    def _build_request_heatmap(self) -> List[float]:
+        """根据待处理请求生成归一化热力图"""
+        heatmap = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+
+        if not self.pending_requests:
+            return heatmap.flatten().tolist()
+
+        minx, miny, maxx, maxy = self.region_bounds
+        width = max(maxx - minx, 1e-6)
+        height = max(maxy - miny, 1e-6)
+
+        for req in self.pending_requests:
+            lon, lat = req.location
+            # 归一化到 [0, grid_size)
+            x_norm = (lon - minx) / width
+            y_norm = (lat - miny) / height
+            x_idx = int(np.clip(x_norm * self.grid_size, 0, self.grid_size - 1))
+            y_idx = int(np.clip(y_norm * self.grid_size, 0, self.grid_size - 1))
+            heatmap[y_idx, x_idx] += 1
+
+        # 归一化到 [0,1]
+        heatmap = heatmap / np.max(heatmap)
+        return heatmap.flatten().tolist()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""

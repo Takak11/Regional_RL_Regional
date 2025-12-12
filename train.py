@@ -490,6 +490,17 @@ class ImprovedDQNAgent:
             self.reward_normalizer.count = checkpoint['reward_normalizer']['count']
 
 
+def set_global_seeds(seed: int):
+    """Set global random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def train_improved_dqn(
         trajectory_file: str,
         region_file: str,
@@ -508,12 +519,13 @@ def train_improved_dqn(
         epsilon_decay: int = 10000,
         target_update_freq: int = 100,
         save_freq: int = 100,
-        state_dim: int = 128,
+        state_dim: int = None,
         use_double_dqn: bool = True,
         use_prioritized_replay: bool = True,
         use_reward_norm: bool = True,
         log_dir: str = './logs',
-        model_dir: str = './models'
+        model_dir: str = './models',
+        seed: int = config.random_seed
 ):
     """
     改进的DQN训练主函数 - 带进度条和详细统计
@@ -521,6 +533,10 @@ def train_improved_dqn(
     # 创建目录
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
+
+    # 统一设置随机种子
+    if seed is not None:
+        set_global_seeds(seed)
 
     # 初始化TensorBoard
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -541,11 +557,16 @@ def train_improved_dqn(
         factory=factory,
         max_steps=max_steps
     )
+    if seed is not None:
+        env.seed(seed)
+
+    # 根据环境的观测空间确定状态维度，避免手动配置失配
+    resolved_state_dim = env.observation_space.shape[0]
 
     # 创建智能体
     print("创建改进的DQN智能体...")
     agent = ImprovedDQNAgent(
-        state_dim=state_dim,
+        state_dim=resolved_state_dim,
         max_action_dim=env.num_dispatch_points,
         lr=lr,
         gamma=gamma,
