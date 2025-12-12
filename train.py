@@ -21,6 +21,64 @@ config = Config()
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'reachable_mask'))
 
 
+def run_policy_evaluation(env: 'EdgeEnv', agent: 'ImprovedDQNAgent', max_steps: int,
+                          episodes: int, eval_epsilon: float) -> tuple:
+    """使用近乎贪心策略评估当前智能体，减少训练探索噪声对成功率的影响"""
+    eval_rewards = []
+    eval_success_rates = []
+    eval_wait_times = []
+
+    original_epsilon = agent.epsilon
+    agent.epsilon = eval_epsilon
+
+    try:
+        for _ in range(episodes):
+            state = env.reset()
+            episode_reward = 0.0
+
+            for _ in range(max_steps):
+                point_result = env._extract_point_features()
+                reachable_indices = point_result.reachable_indices
+
+                reachable_mask = np.zeros(env.num_dispatch_points, dtype=bool)
+                if len(reachable_indices) > 0:
+                    reachable_mask[reachable_indices] = True
+
+                action = agent.select_action(state, reachable_mask, epsilon=eval_epsilon)
+
+                next_state, reward, done, info = env.step(action)
+                state = next_state
+                episode_reward += reward
+
+                if done:
+                    break
+
+            stats = info['episode_stats']
+            served = stats.get('served_requests', 0)
+            failed = stats.get('failed_requests', 0)
+            pending = info.get('pending_requests', 0)
+            total_requests = served + failed + pending
+            success_rate = (served / total_requests * 100) if total_requests > 0 else 0.0
+
+            if stats.get('wait_time_count', 0) > 0:
+                avg_wait_time = stats['total_wait_time'] / stats['wait_time_count']
+            else:
+                avg_wait_time = 0.0
+
+            eval_rewards.append(episode_reward)
+            eval_success_rates.append(success_rate)
+            eval_wait_times.append(avg_wait_time)
+    finally:
+        # 恢复训练时的探索率
+        agent.epsilon = original_epsilon
+
+    mean_success = float(np.mean(eval_success_rates)) if eval_success_rates else 0.0
+    mean_reward = float(np.mean(eval_rewards)) if eval_rewards else 0.0
+    mean_wait = float(np.mean(eval_wait_times)) if eval_wait_times else 0.0
+
+    return mean_success, mean_reward, mean_wait
+
+
 class OptimalPointTracker:
     """追踪历史最优调度点"""
 
@@ -519,6 +577,9 @@ def train_improved_dqn(
         epsilon_decay: int = 10000,
         target_update_freq: int = 100,
         save_freq: int = 100,
+        eval_interval: int = 50,
+        eval_episodes: int = 3,
+        eval_epsilon: float = 0.05,
         state_dim: int = None,
         use_double_dqn: bool = True,
         use_prioritized_replay: bool = True,
@@ -690,7 +751,8 @@ def train_improved_dqn(
         stats = info['episode_stats']
         served = stats.get('served_requests', 0)
         failed = stats.get('failed_requests', 0)
-        total_requests = served + failed
+        pending = info.get('pending_requests', 0)
+        total_requests = served + failed + pending
         success_rate = (served / total_requests * 100) if total_requests > 0 else 0
 
         # 计算平均等待时间
@@ -757,6 +819,25 @@ def train_improved_dqn(
             q_stats = agent.get_q_stats()
             print(f"  Q值统计: μ={q_stats['mean_q']:.2f}, σ={q_stats['std_q']:.2f}")
             print("-" * 100)
+
+        # 定期评估，以平滑展示随训练进程提升的成功率
+        if episode % eval_interval == 0:
+            eval_success, eval_reward, eval_wait = run_policy_evaluation(
+                env=env,
+                agent=agent,
+                max_steps=max_steps,
+                episodes=eval_episodes,
+                eval_epsilon=eval_epsilon
+            )
+
+            writer.add_scalar('Eval/Success_Rate', eval_success, episode)
+            writer.add_scalar('Eval/Reward', eval_reward, episode)
+            writer.add_scalar('Eval/Avg_Wait_Time', eval_wait, episode)
+
+            print(
+                f"  [Eval every {eval_interval}] 成功率: {eval_success:.1f}% | "
+                f"奖励: {eval_reward:.2f} | 平均等待: {eval_wait:.2f}min"
+            )
 
     # 保存最终模型
     print()  # 换行
