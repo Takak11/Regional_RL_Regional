@@ -98,6 +98,16 @@ class DispatchPointManager:
         region_points = self.dispatch_df[
             self.dispatch_df['region_id'] == region_id
             ]
+        if region_points.empty:
+            # 确保区域至少有一个可用的调度点，避免action space为空
+            center_lon, center_lat = self.region_manager.get_region_center(region_id)
+            return [{
+                'id': f'fallback_{region_id}',
+                'longitude': center_lon,
+                'latitude': center_lat,
+                'region_id': region_id
+            }]
+
         return region_points.to_dict('records')
 
     def find_nearest_dispatch_point(self, lat: float, lon: float, region_id: int) -> Optional[Dict]:
