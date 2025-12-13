@@ -54,6 +54,8 @@ class MCSMatcher:
         # 随机顺序处理MCS
         mcs_order = np_random.permutation(available_mcs_indices).tolist()
 
+        explore_prob = np.clip(epsilon, 0.0, 1.0)
+
         for mcs_idx in mcs_order:
             mcs = mcs_list[mcs_idx]
             reachable = mcs_reachable_map[mcs_idx]
@@ -65,18 +67,18 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            # 获取这些点的scores
-            point_scores = [(p, action_scores[p]) for p in available_points]
-
-            # 按score排序，选择top-k
-            point_scores.sort(key=lambda x: x[1], reverse=True)
-            top_k_points = point_scores[:min(k, len(point_scores))]
-
-            if not top_k_points:
-                continue
-            if np_random.random() < epsilon:  # 训练初期epsilon大
-                selected_point = int(np_random.choice([p for p, _ in top_k_points]))
+            if np_random.random() < explore_prob:
+                selected_point = int(np_random.choice(available_points))
             else:
+                # 获取这些点的scores
+                point_scores = [(p, action_scores[p]) for p in available_points]
+
+                # 按score排序，选择top-k
+                point_scores.sort(key=lambda x: x[1], reverse=True)
+                top_k_points = point_scores[:min(k, len(point_scores))]
+
+                if not top_k_points:
+                    continue
                 selected_point = top_k_points[0][0]
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
@@ -350,7 +352,7 @@ class EdgeEnv(gym.Env):
     def _compute_dispatch_epsilon(self) -> float:
         """根据训练进度动态调整调度阶段的epsilon。"""
         progress = np.clip(self.training_progress, 0.0, 1.0)
-        return max(0.1, 1.0 - progress)
+        return 1.0 - progress
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
