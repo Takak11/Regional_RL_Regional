@@ -67,8 +67,11 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            # 获取这些点的scores
-            point_scores = [(p, action_scores[p]) for p in available_points]
+            if np_random.random() < explore_prob:
+                selected_point = int(np_random.choice(available_points))
+            else:
+                # 获取这些点的scores
+                point_scores = [(p, action_scores[p]) for p in available_points]
 
             # 按score排序，选择top-k 再做概率抽样，初期更随机，后期更偏向高分
             point_scores.sort(key=lambda x: x[1], reverse=True)
