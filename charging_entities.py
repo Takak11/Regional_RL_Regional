@@ -169,7 +169,7 @@ class FCS:
     location: Tuple[float, float]
     region_id: int
     charging_piles: List[ChargingPile] = field(default_factory=list)
-    waiting_queue: List[QueuedRequest] = field(default_factory=list)  # 等待队列
+    # waiting_queue: List[QueuedRequest] = field(default_factory=list)  # 等待队列
 
     def __post_init__(self):
         if not self.charging_piles:
@@ -181,9 +181,9 @@ class FCS:
         """获取可用充电桩"""
         return [pile for pile in self.charging_piles if not pile.is_occupied]
 
-    def get_queue_length(self) -> int:
-        """获取排队长度"""
-        return len(self.waiting_queue)
+    # def get_queue_length(self) -> int:
+    #     """获取排队长度"""
+    #     return len(self.waiting_queue)
 
     def _get_pile_available_times(self, current_time: datetime) -> Dict[int, datetime]:
         """获取每个充电桩的可用时间"""
@@ -202,185 +202,186 @@ class FCS:
 
         return pile_times
 
-    def _recalculate_queue_schedule(self, current_time: datetime):
-        """重新计算整个队列的调度"""
-        if not self.waiting_queue:
-            return
-
-        # 获取每个桩的当前可用时间
-        pile_available_times = self._get_pile_available_times(current_time)
-
-        # 为队列中的每个请求重新分配桩和开始时间
-        for request in self.waiting_queue:
-            # 找到最早可用的桩
-            earliest_pile_id = min(pile_available_times,
-                                   key=lambda pid: pile_available_times[pid])
-            earliest_time = pile_available_times[earliest_pile_id]
-
-            # 分配给这个请求
-            request.assigned_pile_id = earliest_pile_id
-            request.expected_start_time = earliest_time
-
-            # 更新该桩的下次可用时间
-            pile_available_times[earliest_pile_id] = earliest_time + timedelta(
-                minutes=request.estimated_charge_time
-            )
-
-    def add_to_queue(self, ev_id: int, request_time: datetime,
-                     charge_needed: float, current_time: datetime) -> QueuedRequest:
-        """将EV加入排队队列"""
-        # 计算充电时长
-        charge_time = (charge_needed / config.CHARGING_POWER) * 60  # 分钟
-
-        # 创建排队请求（先不分配桩和时间）
-        queued_request = QueuedRequest(
-            ev_id=ev_id,
-            request_time=request_time,
-            estimated_charge_needed=charge_needed,
-            estimated_charge_time=charge_time,
-            expected_start_time=current_time  # 临时值
-        )
-
-        self.waiting_queue.append(queued_request)
-
-        # 重新计算整个队列的调度
-        self._recalculate_queue_schedule(current_time)
-
-        return queued_request
-
-    def remove_from_queue(self, ev_id: int, current_time: datetime) -> bool:
-        """从队列中移除EV并重新调度"""
-        # 查找并移除
-        removed = False
-        for i, req in enumerate(self.waiting_queue):
-            if req.ev_id == ev_id:
-                self.waiting_queue.pop(i)
-                removed = True
-                break
-
-        if not removed:
-            return False
-
-        # 重新计算整个队列的调度
-        self._recalculate_queue_schedule(current_time)
-
-        return True
-
-    def on_pile_released(self, pile_id: int, current_time: datetime):
-        """当充电桩释放时调用，重新调度队列"""
-        # 充电桩释放，可能影响队列调度
-        self._recalculate_queue_schedule(current_time)
-
-    def get_next_from_queue(self, current_time: datetime) -> Optional[Tuple[int, int]]:
-        """从队列中获取下一个要充电的EV及其分配的桩
-
-        Returns:
-            (ev_id, pile_id) 或 None
-        """
-        if not self.waiting_queue:
-            return None
-
-        # 重新计算调度（确保使用最新状态）
-        self._recalculate_queue_schedule(current_time)
-
-        # 找出所有可以立即开始充电的请求
-        ready_requests = []
-        for i, req in enumerate(self.waiting_queue):
-            if req.expected_start_time <= current_time and req.assigned_pile_id is not None:
-                # 检查分配的桩是否真的可用
-                pile = self.charging_piles[req.assigned_pile_id]
-                if not pile.is_occupied:
-                    ready_requests.append((i, req))
-
-        if not ready_requests:
-            return None
-
-        # 选择等待时间最长的（FIFO原则）
-        idx, selected_req = min(ready_requests,
-                                key=lambda x: x[1].request_time)
-
-        # 从队列中移除
-        self.waiting_queue.pop(idx)
-
-        # 重新调度剩余队列
-        if self.waiting_queue:
-            self._recalculate_queue_schedule(current_time)
-
-        return (selected_req.ev_id, selected_req.assigned_pile_id)
-
+    # def _recalculate_queue_schedule(self, current_time: datetime):
+    #     """重新计算整个队列的调度"""
+    #     if not self.waiting_queue:
+    #         return
+    #
+    #     # 获取每个桩的当前可用时间
+    #     pile_available_times = self._get_pile_available_times(current_time)
+    #
+    #     # 为队列中的每个请求重新分配桩和开始时间
+    #     for request in self.waiting_queue:
+    #         # 找到最早可用的桩
+    #         earliest_pile_id = min(pile_available_times,
+    #                                key=lambda pid: pile_available_times[pid])
+    #         earliest_time = pile_available_times[earliest_pile_id]
+    #
+    #         # 分配给这个请求
+    #         request.assigned_pile_id = earliest_pile_id
+    #         request.expected_start_time = earliest_time
+    #
+    #         # 更新该桩的下次可用时间
+    #         pile_available_times[earliest_pile_id] = earliest_time + timedelta(
+    #             minutes=request.estimated_charge_time
+    #         )
+    #
+    # def add_to_queue(self, ev_id: int, request_time: datetime,
+    #                  charge_needed: float, current_time: datetime) -> QueuedRequest:
+    #     """将EV加入排队队列"""
+    #     # 计算充电时长
+    #     charge_time = (charge_needed / config.CHARGING_POWER) * 60  # 分钟
+    #
+    #     # 创建排队请求（先不分配桩和时间）
+    #     queued_request = QueuedRequest(
+    #         ev_id=ev_id,
+    #         request_time=request_time,
+    #         estimated_charge_needed=charge_needed,
+    #         estimated_charge_time=charge_time,
+    #         expected_start_time=current_time  # 临时值
+    #     )
+    #
+    #     self.waiting_queue.append(queued_request)
+    #
+    #     # 重新计算整个队列的调度
+    #     self._recalculate_queue_schedule(current_time)
+    #
+    #     return queued_request
+    #
+    # def remove_from_queue(self, ev_id: int, current_time: datetime) -> bool:
+    #     """从队列中移除EV并重新调度"""
+    #     # 查找并移除
+    #     removed = False
+    #     for i, req in enumerate(self.waiting_queue):
+    #         if req.ev_id == ev_id:
+    #             self.waiting_queue.pop(i)
+    #             removed = True
+    #             break
+    #
+    #     if not removed:
+    #         return False
+    #
+    #     # 重新计算整个队列的调度
+    #     self._recalculate_queue_schedule(current_time)
+    #
+    #     return True
+    #
+    # def on_pile_released(self, pile_id: int, current_time: datetime):
+    #     """当充电桩释放时调用，重新调度队列"""
+    #     # 充电桩释放，可能影响队列调度
+    #     self._recalculate_queue_schedule(current_time)
+    #
+    # def get_next_from_queue(self, current_time: datetime) -> Optional[Tuple[int, int]]:
+    #     """从队列中获取下一个要充电的EV及其分配的桩
+    #
+    #     Returns:
+    #         (ev_id, pile_id) 或 None
+    #     """
+    #     if not self.waiting_queue:
+    #         return None
+    #
+    #     # 重新计算调度（确保使用最新状态）
+    #     self._recalculate_queue_schedule(current_time)
+    #
+    #     # 找出所有可以立即开始充电的请求
+    #     ready_requests = []
+    #     for i, req in enumerate(self.waiting_queue):
+    #         if req.expected_start_time <= current_time and req.assigned_pile_id is not None:
+    #             # 检查分配的桩是否真的可用
+    #             pile = self.charging_piles[req.assigned_pile_id]
+    #             if not pile.is_occupied:
+    #                 ready_requests.append((i, req))
+    #
+    #     if not ready_requests:
+    #         return None
+    #
+    #     # 选择等待时间最长的（FIFO原则）
+    #     idx, selected_req = min(ready_requests,
+    #                             key=lambda x: x[1].request_time)
+    #
+    #     # 从队列中移除
+    #     self.waiting_queue.pop(idx)
+    #
+    #     # 重新调度剩余队列
+    #     if self.waiting_queue:
+    #         self._recalculate_queue_schedule(current_time)
+    #
+    #     return (selected_req.ev_id, selected_req.assigned_pile_id)
+    #
+    # def get_estimated_wait_time(self, current_time: datetime = None) -> float:
+    #     """获取新到达EV的预计等待时间(分钟)"""
+    #     if current_time is None:
+    #         raise ValueError("必须提供current_time参数")
+    #
+    #     # 如果有可用充电桩,无需等待
+    #     if self.get_available_piles():
+    #         return 0.0
+    #
+    #     # 获取每个桩的可用时间
+    #     pile_available_times = self._get_pile_available_times(current_time)
+    #
+    #     # 考虑队列中的请求，模拟调度
+    #     temp_times = pile_available_times.copy()
+    #
+    #     for request in self.waiting_queue:
+    #         # 找最早可用的桩
+    #         earliest_time = min(temp_times.values())
+    #         earliest_pile = min(temp_times, key=lambda pid: temp_times[pid])
+    #
+    #         # 更新该桩的可用时间
+    #         temp_times[earliest_pile] = earliest_time + timedelta(
+    #             minutes=request.estimated_charge_time
+    #         )
+    #
+    #     # 新请求将在最早可用的桩上充电
+    #     earliest_available = min(temp_times.values())
+    #     wait_time = (earliest_available - current_time).total_seconds() / 60
+    #
+    #     return max(0, wait_time)
+    #
+    # def get_queue_info(self) -> List[Dict]:
+    #     """获取队列信息"""
+    #     return [
+    #         {
+    #             'ev_id': req.ev_id,
+    #             'expected_start_time': req.expected_start_time,
+    #             'estimated_charge_time': req.estimated_charge_time,
+    #             'request_time': req.request_time,
+    #             'assigned_pile_id': req.assigned_pile_id,
+    #             'wait_time_so_far': (datetime.now() - req.request_time).total_seconds() / 60
+    #         }
+    #         for req in self.waiting_queue
+    #     ]
+    #
+    # def get_pile_schedule(self, current_time: datetime) -> Dict[int, List[Dict]]:
+    #     """获取每个充电桩的调度情况"""
+    #     schedule = {pile.pile_id: [] for pile in self.charging_piles}
+    #
+    #     # 添加当前正在充电的
+    #     for pile in self.charging_piles:
+    #         if pile.is_occupied and pile.ev_id:
+    #             schedule[pile.pile_id].append({
+    #                 'ev_id': pile.ev_id,
+    #                 'start_time': pile.charging_start_time,
+    #                 'end_time': pile.estimated_finish_time,
+    #                 'status': 'charging'
+    #             })
+    #
+    #     # 添加排队等待的
+    #     for req in self.waiting_queue:
+    #         if req.assigned_pile_id is not None:
+    #             schedule[req.assigned_pile_id].append({
+    #                 'ev_id': req.ev_id,
+    #                 'start_time': req.expected_start_time,
+    #                 'end_time': req.expected_start_time + timedelta(
+    #                     minutes=req.estimated_charge_time
+    #                 ),
+    #                 'status': 'queued'
+    #             })
+    #
+    #     return schedule
     def get_estimated_wait_time(self, current_time: datetime = None) -> float:
-        """获取新到达EV的预计等待时间(分钟)"""
-        if current_time is None:
-            raise ValueError("必须提供current_time参数")
-
-        # 如果有可用充电桩,无需等待
-        if self.get_available_piles():
-            return 0.0
-
-        # 获取每个桩的可用时间
-        pile_available_times = self._get_pile_available_times(current_time)
-
-        # 考虑队列中的请求，模拟调度
-        temp_times = pile_available_times.copy()
-
-        for request in self.waiting_queue:
-            # 找最早可用的桩
-            earliest_time = min(temp_times.values())
-            earliest_pile = min(temp_times, key=lambda pid: temp_times[pid])
-
-            # 更新该桩的可用时间
-            temp_times[earliest_pile] = earliest_time + timedelta(
-                minutes=request.estimated_charge_time
-            )
-
-        # 新请求将在最早可用的桩上充电
-        earliest_available = min(temp_times.values())
-        wait_time = (earliest_available - current_time).total_seconds() / 60
-
-        return max(0, wait_time)
-
-    def get_queue_info(self) -> List[Dict]:
-        """获取队列信息"""
-        return [
-            {
-                'ev_id': req.ev_id,
-                'expected_start_time': req.expected_start_time,
-                'estimated_charge_time': req.estimated_charge_time,
-                'request_time': req.request_time,
-                'assigned_pile_id': req.assigned_pile_id,
-                'wait_time_so_far': (datetime.now() - req.request_time).total_seconds() / 60
-            }
-            for req in self.waiting_queue
-        ]
-
-    def get_pile_schedule(self, current_time: datetime) -> Dict[int, List[Dict]]:
-        """获取每个充电桩的调度情况"""
-        schedule = {pile.pile_id: [] for pile in self.charging_piles}
-
-        # 添加当前正在充电的
-        for pile in self.charging_piles:
-            if pile.is_occupied and pile.ev_id:
-                schedule[pile.pile_id].append({
-                    'ev_id': pile.ev_id,
-                    'start_time': pile.charging_start_time,
-                    'end_time': pile.estimated_finish_time,
-                    'status': 'charging'
-                })
-
-        # 添加排队等待的
-        for req in self.waiting_queue:
-            if req.assigned_pile_id is not None:
-                schedule[req.assigned_pile_id].append({
-                    'ev_id': req.ev_id,
-                    'start_time': req.expected_start_time,
-                    'end_time': req.expected_start_time + timedelta(
-                        minutes=req.estimated_charge_time
-                    ),
-                    'status': 'queued'
-                })
-
-        return schedule
-
+        return 0
 @dataclass
 class ChargingRequest:
     ev_id: int

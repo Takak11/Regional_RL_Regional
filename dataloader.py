@@ -226,7 +226,7 @@ class DataLoader:
             state = self.ev_states[ev_id]
 
             # 跳过正在充电的EV
-            if state['status'] in ['charging', 'waiting']:
+            if state['status'] in ['charging', 'waiting', 'requesting', '']:
                 continue
 
             # 更新位置

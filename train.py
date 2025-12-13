@@ -867,7 +867,7 @@ if __name__ == '__main__':
         trajectory_file=TRAJECTORY_FILE,
         region_file=REGION_FILE,
         dispatch_points_file=DISPATCH_POINTS_FILE,
-        region_id=9,
+        region_id=0,
         num_episodes=500,
         max_steps=100,
         batch_size=128,

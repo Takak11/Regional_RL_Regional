@@ -5,30 +5,29 @@ from typing import Optional
 @dataclass
 class Config:
 
-    EXPECTED_MAX_QUEUING_LENGTH = 5.0
-    EXPECTED_MAX_FCS_WAIT_TIME = 5.0
+    # EXPECTED_MAX_QUEUING_LENGTH = 3.0
+    EXPECTED_MAX_FCS_WAIT_TIME = 30.0
 
     # 基本设置
     NUM_REGIONS: int = 18
-    FCS_CHARGING_PILES: int = 3
+    FCS_CHARGING_PILES: int = 2
     MCS_PER_REGION: int = 5
+    # MAX_WAITING_EVS: int = 3
 
     TIME_STEP: int = 5
     TOTAL_TIMESTEP: int = 100
-    MAX_WAITING_TIME: int = 20
+    MAX_WAITING_TIME: int = 60
 
     MCS_SCHEDULE_R: int = 2
 
     MOVING_SPEED: float = 40.0
-    FCS_CHOICE_P: float = 0.5
-    REACH_TIME: int = 20
     # EV电量相关
     CHARGING_POWER: float = 100.0
     MCS_CHARGING_POWER: float = 100.0
     TARGET_CHARGE_LEVEL: float = 0.85
-    REQUEST_THRESHOLD: float = 0.2
+    REQUEST_THRESHOLD: float = 0.15
     SAFE_REACH_THRESHOLD: float = 1
-    BATTERY_CAPACITY: float = 50.0
+    BATTERY_CAPACITY: float = 60.0
     ENERGY_CONSUMPTION: float = 0.16
     CHARGING_FEE: float = 0.8
 
