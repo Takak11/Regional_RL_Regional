@@ -31,7 +31,8 @@ class MCSMatcher:
             dispatch_points: List[Dict],
             action_scores: np.ndarray,
             np_random,
-            k: int = 3
+            k: int = 3,
+            epsilon: float = 1.0
     ) -> Dict[int, int]:
         available_mcs_indices = [
             i for i, mcs in enumerate(mcs_list)
@@ -73,7 +74,10 @@ class MCSMatcher:
 
             if not top_k_points:
                 continue
-
+            if np_random.random() < epsilon:  # 训练初期epsilon大
+                selected_point = int(np_random.choice([p for p, _ in top_k]))
+            else:
+                selected_point = top_k[0][0]
             selected_point = top_k_points[0][0]
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
@@ -369,6 +373,8 @@ class EdgeEnv(gym.Env):
             mcs.start_movement(target_location, arrival_time, None)
             mcs.total_distance_traveled += distance
 
+        self._generate_charging_requests()
+
         self._update_mcs_status()
 
         self._process_charging_requests()
@@ -380,8 +386,6 @@ class EdgeEnv(gym.Env):
         self.current_time += timedelta(minutes=config.TIME_STEP)
         self.data_loader.update_ev_movement()
 
-        # 6. 生成新的充电请求
-        self._generate_charging_requests()
 
         # 7. 计算奖励
         reward = self._calculate_simple_reward()
@@ -470,33 +474,19 @@ class EdgeEnv(gym.Env):
             ev_state = self.data_loader.get_ev_state().get(request.ev_id)
             if ev_state and ev_state.get('chose_fcs'):
                 # EV选择了FCS
-                available_piles = self.fcs.get_available_piles()
+                piles = self.fcs.charging_piles
+                for pile in piles:
+                    if pile.estimated_finish_time is not None:
+                        continue
+                    if pile.is_occupied and pile.ev_id == request.ev_id:
+                        # 有可用充电桩，立即开始充电
+                        self._start_fcs_charging(request.ev_id, pile)
+                        served_requests.append(request)
 
-                if available_piles:
-                    # 有可用充电桩，立即开始充电
-                    self._start_fcs_charging(request.ev_id, available_piles[0])
-                    served_requests.append(request)
-
-                    # 记录等待时间
-                    self.episode_stats['total_wait_time'] += wait_time
-                    self.episode_stats['wait_time_count'] += 1
-                    continue
-                # else:
-                #     # 无可用充电桩，检查是否已在队列中
-                #     in_queue = any(req.ev_id == request.ev_id for req in self.fcs.waiting_queue)
-                #     if not in_queue:
-                #         # 加入队列
-                #         target_charge = config.BATTERY_CAPACITY * config.TARGET_CHARGE_LEVEL
-                #         charge_needed = max(0, target_charge - ev_state.get('current_charge', 0))
-                #
-                #         self.fcs.add_to_queue(
-                #             ev_id=request.ev_id,
-                #             request_time=request.request_time,
-                #             charge_needed=charge_needed,
-                #             current_time=self.current_time
-                #         )
-                #     continue
-
+                        # 记录等待时间
+                        self.episode_stats['total_wait_time'] += wait_time
+                        self.episode_stats['wait_time_count'] += 1
+                        continue
             # 尝试匹配MCS
             for mcs in self.mcs_list:
                 if mcs.status == MCSStatus.ASSIGNED and not mcs.assigned_ev:
@@ -531,18 +521,19 @@ class EdgeEnv(gym.Env):
 
         # 批量更新统计
         for request in served_requests:
-            self.pending_requests.remove(request)
-            if request.ev_id in self.active_requests:
-                del self.active_requests[request.ev_id]
-            self.served_ev_ids.add(request.ev_id)
-            self.episode_stats['served_requests'] += 1
+            if request in self.pending_requests:
+                self.pending_requests.remove(request)
+                if request.ev_id in self.active_requests:
+                    del self.active_requests[request.ev_id]
+                self.served_ev_ids.add(request.ev_id)
+                self.episode_stats['served_requests'] += 1
 
-            ev_state = self.data_loader.get_ev_state().get(request.ev_id)
-            if ev_state:
-                if ev_state.get('assigned_fcs') is not None:
-                    self.episode_stats['fcs_served'] += 1
-                elif ev_state.get('assigned_mcs') is not None:
-                    self.episode_stats['mcs_served'] += 1
+                ev_state = self.data_loader.get_ev_state().get(request.ev_id)
+                if ev_state:
+                    if ev_state.get('assigned_fcs') is not None:
+                        self.episode_stats['fcs_served'] += 1
+                    elif ev_state.get('assigned_mcs') is not None:
+                        self.episode_stats['mcs_served'] += 1
 
     def _update_fcs_status(self):
         """更新FCS状态(使用新的队列管理系统)"""
@@ -585,24 +576,7 @@ class EdgeEnv(gym.Env):
                     pile.estimated_finish_time = None
                     pile.charge_amount = 0
 
-                    # 通知FCS重新调度队列
-                    # self.fcs.on_pile_released(pile_id, self.current_time)
-
-        # 2. 处理等待队列 - 使用新的队列管理API
-        # while True:
-        #     # 获取下一个可以开始充电的EV
-        #     next_ev_info = self.fcs.get_next_from_queue(self.current_time)
-        #
-        #     if next_ev_info is None:
-        #         break
-        #
-        #     ev_id, pile_id = next_ev_info
-        #     pile = self.fcs.charging_piles[pile_id]
-        #
-        #     # 开始充电
-        #     self._start_fcs_charging(ev_id, pile)
-
-    def _start_fcs_charging(self, ev_id: int, pile: ChargingPile, charging_start_time: datetime):
+    def _start_fcs_charging(self, ev_id: int, pile: ChargingPile):
         """开始FCS充电"""
         ev_state = self.data_loader.get_ev_state().get(ev_id)
         if not ev_state:
@@ -692,17 +666,6 @@ class EdgeEnv(gym.Env):
             total_piles = len(self.fcs.charging_piles)
             used_piles = total_piles - len(self.fcs.get_available_piles())
             load_ratio = used_piles / total_piles
-
-            #
-            # base_prob = 0.7
-            # k = 0.5
-            # fcs_prob = base_prob * (1 - k * load_ratio)
-            #
-            # # 添加随机扰动
-            # noise = self.np_random.uniform(-0.05, 0.05)
-            # fcs_prob = np.clip(fcs_prob + noise, 0.1, 0.9)
-            #
-            # if self.np_random.random() < fcs_prob and self.fcs.get_queue_length() < config.MAX_WAITING_EVS:
             if load_ratio != 1:
                 # 选择FCS
                 self.data_loader.update_ev_state(ev_id, {
@@ -722,10 +685,10 @@ class EdgeEnv(gym.Env):
                 self.data_loader.update_ev_state(ev_id, {
                     'current_charge': new_charge
                 })
-                # 选择了FCS，标记为占用
-                for pile in self.fcs.get_available_piles():
-                    pile.is_occupied = True
-                    break
+                assigned_fcs = self.fcs.get_available_piles()[0]
+                assigned_fcs.is_occupied = True
+                assigned_fcs.ev_id = request.ev_id
+
             else:
                 # 选择MCS
                 point = self.data_loader.find_nearest_dispatch_point(

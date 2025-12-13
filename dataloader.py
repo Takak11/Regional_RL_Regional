@@ -232,7 +232,6 @@ class DataLoader:
             # 更新位置
             old_location = state['current_location']
             new_location = (row['latitude'], row['longitude'])
-
             # 计算距离和消耗电量
             if old_location:
                 distance = haversine_distance(

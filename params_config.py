@@ -18,7 +18,7 @@ class Config:
     TOTAL_TIMESTEP: int = 100
     MAX_WAITING_TIME: int = 60
 
-    MCS_SCHEDULE_R: int = 2
+    MCS_SCHEDULE_R: int = 3
 
     MOVING_SPEED: float = 40.0
     # EV电量相关
