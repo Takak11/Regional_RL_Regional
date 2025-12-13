@@ -67,28 +67,25 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            if np_random.random() < explore_prob:
-                selected_point = int(np_random.choice(available_points))
-            else:
-                # 获取这些点的scores
-                point_scores = [(p, action_scores[p]) for p in available_points]
+            # 获取这些点的scores，不再限制为top-k，直接在全部可达点上退火抽样
+            point_scores = [(p, float(action_scores[p])) for p in available_points]
 
-            # 按score排序，选择top-k 再做概率抽样，初期更随机，后期更偏向高分
-            point_scores.sort(key=lambda x: x[1], reverse=True)
-            top_k_points = point_scores[:min(k, len(point_scores))]
-
-            # 仅保留top-k候选，构建混合概率（explore_prob决定均匀随机占比）
-            candidate_points = [p for p, _ in top_k_points]
-            candidate_scores = np.array([s for _, s in top_k_points], dtype=float)
+            candidate_points = [p for p, _ in point_scores]
+            candidate_scores = np.array([s for _, s in point_scores], dtype=float)
 
             if len(candidate_points) == 1:
                 selected_point = candidate_points[0]
             else:
-                # 防止分布过于尖锐，温度随探索度降低
+                # 高探索时温度大且加入均匀分布，初始几乎完全随机；
+                # 训练进度上升后逐渐由softmax分布主导。
                 temperature = 1.0 + 4.0 * explore_prob
                 stabilized = candidate_scores - np.max(candidate_scores)
                 score_probs = np.exp(stabilized / max(1e-6, temperature))
-                score_probs /= np.sum(score_probs)
+                score_sum = np.sum(score_probs)
+                if score_sum > 0:
+                    score_probs /= score_sum
+                else:
+                    score_probs = np.ones_like(score_probs) / len(score_probs)
 
                 uniform_probs = np.ones_like(score_probs) / len(score_probs)
                 mix_probs = explore_prob * uniform_probs + (1 - explore_prob) * score_probs
