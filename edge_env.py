@@ -73,13 +73,28 @@ class MCSMatcher:
                 # 获取这些点的scores
                 point_scores = [(p, action_scores[p]) for p in available_points]
 
-                # 按score排序，选择top-k
-                point_scores.sort(key=lambda x: x[1], reverse=True)
-                top_k_points = point_scores[:min(k, len(point_scores))]
+            # 按score排序，选择top-k 再做概率抽样，初期更随机，后期更偏向高分
+            point_scores.sort(key=lambda x: x[1], reverse=True)
+            top_k_points = point_scores[:min(k, len(point_scores))]
 
-                if not top_k_points:
-                    continue
-                selected_point = top_k_points[0][0]
+            # 仅保留top-k候选，构建混合概率（explore_prob决定均匀随机占比）
+            candidate_points = [p for p, _ in top_k_points]
+            candidate_scores = np.array([s for _, s in top_k_points], dtype=float)
+
+            if len(candidate_points) == 1:
+                selected_point = candidate_points[0]
+            else:
+                # 防止分布过于尖锐，温度随探索度降低
+                temperature = 1.0 + 4.0 * explore_prob
+                stabilized = candidate_scores - np.max(candidate_scores)
+                score_probs = np.exp(stabilized / max(1e-6, temperature))
+                score_probs /= np.sum(score_probs)
+
+                uniform_probs = np.ones_like(score_probs) / len(score_probs)
+                mix_probs = explore_prob * uniform_probs + (1 - explore_prob) * score_probs
+                mix_probs /= np.sum(mix_probs)
+
+                selected_point = int(np_random.choice(candidate_points, p=mix_probs))
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
 
