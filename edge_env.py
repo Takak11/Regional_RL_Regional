@@ -54,6 +54,8 @@ class MCSMatcher:
         # 随机顺序处理MCS
         mcs_order = np_random.permutation(available_mcs_indices).tolist()
 
+        explore_prob = np.clip(epsilon, 0.0, 1.0)
+
         for mcs_idx in mcs_order:
             mcs = mcs_list[mcs_idx]
             reachable = mcs_reachable_map[mcs_idx]
@@ -65,20 +67,31 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            # 获取这些点的scores
-            point_scores = [(p, action_scores[p]) for p in available_points]
+            # 获取这些点的scores，不再限制为top-k，直接在全部可达点上退火抽样
+            point_scores = [(p, float(action_scores[p])) for p in available_points]
 
-            # 按score排序，选择top-k
-            point_scores.sort(key=lambda x: x[1], reverse=True)
-            top_k_points = point_scores[:min(k, len(point_scores))]
+            candidate_points = [p for p, _ in point_scores]
+            candidate_scores = np.array([s for _, s in point_scores], dtype=float)
 
-            if not top_k_points:
-                continue
-            if np_random.random() < epsilon:  # 训练初期epsilon大
-                selected_point = int(np_random.choice([p for p, _ in top_k]))
+            if len(candidate_points) == 1:
+                selected_point = candidate_points[0]
             else:
-                selected_point = top_k[0][0]
-            selected_point = top_k_points[0][0]
+                # 高探索时温度大且加入均匀分布，初始几乎完全随机；
+                # 训练进度上升后逐渐由softmax分布主导。
+                temperature = 1.0 + 4.0 * explore_prob
+                stabilized = candidate_scores - np.max(candidate_scores)
+                score_probs = np.exp(stabilized / max(1e-6, temperature))
+                score_sum = np.sum(score_probs)
+                if score_sum > 0:
+                    score_probs /= score_sum
+                else:
+                    score_probs = np.ones_like(score_probs) / len(score_probs)
+
+                uniform_probs = np.ones_like(score_probs) / len(score_probs)
+                mix_probs = explore_prob * uniform_probs + (1 - explore_prob) * score_probs
+                mix_probs /= np.sum(mix_probs)
+
+                selected_point = int(np_random.choice(candidate_points, p=mix_probs))
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
 
@@ -348,15 +361,22 @@ class EdgeEnv(gym.Env):
 
         return PointFeatureResult(reachable_indices=sorted(reachable_indices))
 
+    def _compute_dispatch_epsilon(self) -> float:
+        """根据训练进度动态调整调度阶段的epsilon。"""
+        progress = np.clip(self.training_progress, 0.0, 1.0)
+        return 1.0 - progress
+
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
         action = validate_action_scores(action)
+        dispatch_epsilon = self._compute_dispatch_epsilon()
         # 1. 执行MCS调度
         matching = self.matcher.match_mcs_to_points_topk(
             self.mcs_list,
             self.dispatch_points,
             action,
-            self.np_random
+            self.np_random,
+            epsilon=dispatch_epsilon
         )
         for mcs_idx, point_idx in matching.items():
             mcs = self.mcs_list[mcs_idx]

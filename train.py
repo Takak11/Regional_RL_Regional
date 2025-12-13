@@ -660,6 +660,7 @@ def train_improved_dqn(
     reward_window = deque(maxlen=100)
     success_rate_window = deque(maxlen=100)
     wait_time_window = deque(maxlen=100)
+    total_expected_steps = num_episodes * max_steps
 
     print("\n" + "=" * 100)
     print(f"{'开始训练 - 区域 ' + str(region_id):^100}")
@@ -675,6 +676,7 @@ def train_improved_dqn(
         episode_losses = []
 
         for step in range(max_steps):
+            env.training_progress = min(1.0, total_steps / total_expected_steps)
             # 获取当前可达点信息
             point_result = env._extract_point_features()
             reachable_indices = point_result.reachable_indices
