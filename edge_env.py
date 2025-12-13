@@ -75,10 +75,9 @@ class MCSMatcher:
             if not top_k_points:
                 continue
             if np_random.random() < epsilon:  # 训练初期epsilon大
-                selected_point = int(np_random.choice([p for p, _ in top_k]))
+                selected_point = int(np_random.choice([p for p, _ in top_k_points]))
             else:
-                selected_point = top_k[0][0]
-            selected_point = top_k_points[0][0]
+                selected_point = top_k_points[0][0]
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
 
@@ -348,15 +347,22 @@ class EdgeEnv(gym.Env):
 
         return PointFeatureResult(reachable_indices=sorted(reachable_indices))
 
+    def _compute_dispatch_epsilon(self) -> float:
+        """根据训练进度动态调整调度阶段的epsilon。"""
+        progress = np.clip(self.training_progress, 0.0, 1.0)
+        return max(0.1, 1.0 - progress)
+
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
         action = validate_action_scores(action)
+        dispatch_epsilon = self._compute_dispatch_epsilon()
         # 1. 执行MCS调度
         matching = self.matcher.match_mcs_to_points_topk(
             self.mcs_list,
             self.dispatch_points,
             action,
-            self.np_random
+            self.np_random,
+            epsilon=dispatch_epsilon
         )
         for mcs_idx, point_idx in matching.items():
             mcs = self.mcs_list[mcs_idx]
