@@ -28,18 +28,22 @@ config = Config()
 class TrainingMonitor:
     """训练监控器 - 实时追踪训练进度"""
 
-    def __init__(self, num_regions: int, checkpoint_dir: str):
+    def __init__(self, num_regions: int, checkpoint_dir: str, manager: Optional[mp.Manager] = None):
         self.num_regions = num_regions
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # 训练状态
-        self.region_status = {}  # {region_id: 'pending'|'training'|'completed'|'failed'}
-        self.region_progress = {}  # {region_id: episode}
-        self.region_metrics = {}  # {region_id: metrics_dict}
-
-        # 锁
-        self.lock = threading.Lock()
+        if manager:
+            self.region_status = manager.dict()  # {region_id: 'pending'|'training'|'completed'|'failed'}
+            self.region_progress = manager.dict()  # {region_id: episode}
+            self.region_metrics = manager.dict()  # {region_id: metrics_dict}
+            self.lock = manager.Lock()
+        else:
+            self.region_status = {}
+            self.region_progress = {}
+            self.region_metrics = {}
+            self.lock = threading.Lock()
 
         # 加载检查点
         self._load_checkpoint()
@@ -53,26 +57,37 @@ class TrainingMonitor:
         if checkpoint_file.exists():
             with open(checkpoint_file, 'r') as f:
                 data = json.load(f)
-                self.region_status = data.get('region_status', {})
-                self.region_progress = {int(k): v for k, v in data.get('region_progress', {}).items()}
-                self.region_metrics = {int(k): v for k, v in data.get('region_metrics', {}).items()}
+                region_status = {int(k): v for k, v in data.get('region_status', {}).items()}
+                region_progress = {int(k): v for k, v in data.get('region_progress', {}).items()}
+                region_metrics = {int(k): v for k, v in data.get('region_metrics', {}).items()}
+
+                with self.lock:
+                    self.region_status.clear()
+                    self.region_status.update(region_status)
+
+                    self.region_progress.clear()
+                    self.region_progress.update(region_progress)
+
+                    self.region_metrics.clear()
+                    self.region_metrics.update(region_metrics)
             print(f"✓ 加载检查点: {checkpoint_file}")
             print(
                 f"  - 已完成区域: {sum(1 for s in self.region_status.values() if s == 'completed')}/{self.num_regions}")
         else:
             # 初始化所有区域为pending
-            for region_id in range(self.num_regions):
-                self.region_status[region_id] = 'pending'
-                self.region_progress[region_id] = 0
-                self.region_metrics[region_id] = {}
+            with self.lock:
+                for region_id in range(self.num_regions):
+                    self.region_status[region_id] = 'pending'
+                    self.region_progress[region_id] = 0
+                    self.region_metrics[region_id] = {}
 
     def _save_checkpoint(self):
         """保存检查点"""
         checkpoint_file = self._checkpoint_file()
         data = {
-            'region_status': self.region_status,
-            'region_progress': self.region_progress,
-            'region_metrics': self.region_metrics,
+            'region_status': dict(self.region_status),
+            'region_progress': dict(self.region_progress),
+            'region_metrics': dict(self.region_metrics),
             'timestamp': datetime.now().isoformat()
         }
         with open(checkpoint_file, 'w') as f:
@@ -134,7 +149,7 @@ class TrainingMonitor:
 class EnhancedGPUManager:
     """增强版GPU管理器 - 支持动态负载均衡"""
 
-    def __init__(self, gpu_ids: List[int] = None, memory_threshold: float = 0.9):
+    def __init__(self, gpu_ids: List[int] = None, memory_threshold: float = 0.9, manager: Optional[mp.Manager] = None):
         """
         Args:
             gpu_ids: 可用GPU ID列表
@@ -152,8 +167,12 @@ class EnhancedGPUManager:
         self.memory_threshold = memory_threshold
 
         # GPU负载追踪
-        self.gpu_load = {gpu_id: 0 for gpu_id in self.gpu_ids}
-        self.lock = threading.Lock()
+        if manager:
+            self.gpu_load = manager.dict({gpu_id: 0 for gpu_id in self.gpu_ids})
+            self.lock = manager.Lock()
+        else:
+            self.gpu_load = {gpu_id: 0 for gpu_id in self.gpu_ids}
+            self.lock = threading.Lock()
 
         print(f"🎮 增强版GPU管理器初始化:")
         print(f"  - 可用GPU数量: {self.num_gpus}")
@@ -420,14 +439,20 @@ def enhanced_parallel_train(
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # 多进程设置
+    mp.set_start_method('spawn', force=True)
+
+    # 进程安全的资源管理
+    manager = mp.Manager()
+
     # 初始化监控器
-    monitor = TrainingMonitor(num_regions, checkpoint_dir)
+    monitor = TrainingMonitor(num_regions, checkpoint_dir, manager=manager)
 
     # 显示当前状态
     monitor.print_summary()
 
     # GPU管理器
-    gpu_manager = EnhancedGPUManager(gpu_ids)
+    gpu_manager = EnhancedGPUManager(gpu_ids, manager=manager)
 
     # 确定最大并行数
     if max_parallel is None:
@@ -452,9 +477,6 @@ def enhanced_parallel_train(
     if not pending_regions:
         print("\n✅ 所有区域已完成训练!")
         return monitor.region_metrics
-
-    # 多进程设置
-    mp.set_start_method('spawn', force=True)
 
     # 训练开始时间
     start_time = time.time()
