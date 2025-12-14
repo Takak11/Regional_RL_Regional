@@ -1,14 +1,16 @@
+"""
+PPO (Proximal Policy Optimization) 训练器
+相比DQN更稳定，更适合连续动作空间
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
-import random
-from collections import deque, namedtuple
 from typing import List, Tuple, Dict
+from collections import deque
 import os
 from datetime import datetime
-import json
 from torch.utils.tensorboard import SummaryWriter
 
 from dataloader import DataLoaderFactory
@@ -17,875 +19,670 @@ from edge_env import EdgeEnv
 
 config = Config()
 
-# 经验回放缓冲区
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done', 'reachable_mask'))
 
+# ============================================================
+# Actor-Critic 网络
+# ============================================================
+class ActorCriticNetwork(nn.Module):
+    """Actor-Critic网络 - 共享特征提取"""
 
-def run_policy_evaluation(env: 'EdgeEnv', agent: 'ImprovedDQNAgent', max_steps: int,
-                          episodes: int, eval_epsilon: float) -> tuple:
-    """使用近乎贪心策略评估当前智能体，减少训练探索噪声对成功率的影响"""
-    eval_rewards = []
-    eval_success_rates = []
-    eval_wait_times = []
-
-    original_epsilon = agent.epsilon
-    agent.epsilon = eval_epsilon
-
-    try:
-        for _ in range(episodes):
-            state = env.reset()
-            episode_reward = 0.0
-
-            for _ in range(max_steps):
-                point_result = env._extract_point_features()
-                reachable_indices = point_result.reachable_indices
-
-                reachable_mask = np.zeros(env.num_dispatch_points, dtype=bool)
-                if len(reachable_indices) > 0:
-                    reachable_mask[reachable_indices] = True
-
-                action = agent.select_action(state, reachable_mask, epsilon=eval_epsilon)
-
-                next_state, reward, done, info = env.step(action)
-                state = next_state
-                episode_reward += reward
-
-                if done:
-                    break
-
-            stats = info['episode_stats']
-            served = stats.get('served_requests', 0)
-            failed = stats.get('failed_requests', 0)
-            pending = info.get('pending_requests', 0)
-            total_requests = served + failed + pending
-            success_rate = (served / total_requests * 100) if total_requests > 0 else 0.0
-
-            if stats.get('wait_time_count', 0) > 0:
-                avg_wait_time = stats['total_wait_time'] / stats['wait_time_count']
-            else:
-                avg_wait_time = 0.0
-
-            eval_rewards.append(episode_reward)
-            eval_success_rates.append(success_rate)
-            eval_wait_times.append(avg_wait_time)
-    finally:
-        # 恢复训练时的探索率
-        agent.epsilon = original_epsilon
-
-    mean_success = float(np.mean(eval_success_rates)) if eval_success_rates else 0.0
-    mean_reward = float(np.mean(eval_rewards)) if eval_rewards else 0.0
-    mean_wait = float(np.mean(eval_wait_times)) if eval_wait_times else 0.0
-
-    return mean_success, mean_reward, mean_wait
-
-
-class OptimalPointTracker:
-    """追踪历史最优调度点"""
-
-    def __init__(self, num_points: int, window_size: int = 100, alpha: float = 0.95):
-        self.num_points = num_points
-        self.alpha = alpha
-        self.point_rewards = np.zeros(num_points)
-        self.point_counts = np.zeros(num_points)
-        self.ema_rewards = np.zeros(num_points)
-
-    def update(self, point_indices: List[int], rewards: List[float]):
-        for idx, reward in zip(point_indices, rewards):
-            if 0 <= idx < self.num_points:
-                self.point_counts[idx] += 1
-                self.point_rewards[idx] += reward
-                if self.point_counts[idx] == 1:
-                    self.ema_rewards[idx] = reward
-                else:
-                    self.ema_rewards[idx] = (self.alpha * self.ema_rewards[idx] +
-                                             (1 - self.alpha) * reward)
-
-    def get_exploration_distribution(self, reachable_mask: np.ndarray,
-                                     temperature: float = 1.0) -> np.ndarray:
-        scores = np.copy(self.ema_rewards)
-        mask = self.point_counts > 0
-        # 未探索点给予平均分
-        if np.any(mask):
-            scores[~mask] = np.mean(self.ema_rewards[mask])
-        scores[~reachable_mask] = -np.inf
-
-        exp_scores = np.exp(scores / temperature)
-        exp_scores[~reachable_mask] = 0
-
-        if exp_scores.sum() > 0:
-            return exp_scores / exp_scores.sum()
-        else:
-            probs = reachable_mask.astype(float)
-            return probs / probs.sum() if probs.sum() > 0 else probs
-
-
-class PrioritizedReplayBuffer:
-    """优先级经验回放缓冲区"""
-
-    def __init__(self, capacity: int = 100000, alpha: float = 0.6, beta: float = 0.4, beta_increment: float = 0.001):
-        self.capacity = capacity
-        self.alpha = alpha  # 优先级指数
-        self.beta = beta  # 重要性采样指数
-        self.beta_increment = beta_increment
-        self.buffer = []
-        self.priorities = np.zeros(capacity, dtype=np.float32)
-        self.position = 0
-        self.max_priority = 1.0
-
-    def push(self, state, action, next_state, reward, done, reachable_mask):
-        """添加经验(使用最大优先级)"""
-        transition = Transition(state, action, next_state, reward, done, reachable_mask)
-
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.position] = transition
-
-        self.priorities[self.position] = self.max_priority
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size: int) -> Tuple[List[Transition], np.ndarray, np.ndarray]:
-        """优先级采样"""
-        if len(self.buffer) == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:len(self.buffer)]
-
-        # 计算采样概率
-        probs = priorities ** self.alpha
-        probs /= probs.sum()
-
-        # 采样索引
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
-        samples = [self.buffer[idx] for idx in indices]
-
-        # 计算重要性采样权重
-        total = len(self.buffer)
-        weights = (total * probs[indices]) ** (-self.beta)
-        weights /= weights.max()
-
-        self.beta = min(1.0, self.beta + self.beta_increment)
-
-        return samples, indices, weights
-
-    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
-        """更新优先级"""
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class ImprovedDQNNetwork(nn.Module):
-    """改进的DQN网络 - 使用Dueling架构"""
-
-    def __init__(self, state_dim: int, max_action_dim: int, hidden_dims: List[int] = [256, 256, 128]):
-        super(ImprovedDQNNetwork, self).__init__()
-
-        self.state_dim = state_dim
-        self.max_action_dim = max_action_dim
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super(ActorCriticNetwork, self).__init__()
 
         # 共享特征提取层
-        layers = []
-        input_dim = state_dim
-
-        for hidden_dim in hidden_dims[:-1]:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.Dropout(0.1))
-            input_dim = hidden_dim
-
-        self.feature_extractor = nn.Sequential(*layers)
-
-        # Dueling 架构
-        # Value stream (状态价值)
-        self.value_stream = nn.Sequential(
-            nn.Linear(input_dim, hidden_dims[-1]),
+        self.shared_layers = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dims[-1], 1)
+            nn.Dropout(0.1),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
         )
 
-        # Advantage stream (动作优势)
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(input_dim, hidden_dims[-1]),
+        # Actor头 - 输出动作分数
+        self.actor_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dims[-1], max_action_dim)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, action_dim)
+        )
+
+        # Critic头 - 输出状态价值
+        self.critic_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1)
         )
 
         # 初始化权重
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        """初始化权重"""
+        """正交初始化提升稳定性"""
         if isinstance(module, nn.Linear):
             nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             nn.init.constant_(module.bias, 0.0)
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, state):
+        """前向传播"""
+        features = self.shared_layers(state)
+        action_scores = self.actor_head(features)
+        state_value = self.critic_head(features)
+        return action_scores, state_value
+
+    def get_action(self, state, reachable_mask=None, deterministic=False):
         """
-        前向传播 - Dueling DQN
-        Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        获取动作
+
+        Args:
+            state: 状态
+            reachable_mask: 可达掩码 (bool array)
+            deterministic: 是否确定性输出
         """
-        features = self.feature_extractor(state)
+        action_scores, value = self.forward(state)
 
-        value = self.value_stream(features)
-        advantages = self.advantage_stream(features)
+        if reachable_mask is not None:
+            # 对不可达的点设置极小值
+            reachable_mask = torch.FloatTensor(reachable_mask).to(action_scores.device)
+            action_scores = action_scores * reachable_mask + (1 - reachable_mask) * (-1e9)
 
-        # 组合: Q = V + (A - mean(A))
-        q_values = value + (advantages - advantages.mean(dim=-1, keepdim=True))
-
-        return q_values
-
-
-class RewardNormalizer:
-    """奖励归一化器 - 使用运行统计"""
-
-    def __init__(self, clip_range: float = 10.0):
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = 0
-        self.clip_range = clip_range
-
-    def update(self, reward: float):
-        """更新统计信息"""
-        self.count += 1
-        delta = reward - self.mean
-        self.mean += delta / self.count
-        self.var += delta * (reward - self.mean)
-
-    def normalize(self, reward: float) -> float:
-        """归一化奖励"""
-        if self.count < 2:
-            return reward
-
-        std = np.sqrt(self.var / (self.count - 1))
-        std = max(std, 1e-6)  # 避免除零
-
-        normalized = (reward - self.mean) / std
-        return np.clip(normalized, -self.clip_range, self.clip_range)
-
-    def get_stats(self) -> Dict:
-        """获取统计信息"""
-        std = np.sqrt(self.var / (self.count - 1)) if self.count > 1 else 1.0
-        return {
-            'mean': self.mean,
-            'std': std,
-            'count': self.count
-        }
+        if deterministic:
+            # 确定性：直接返回最高分数
+            return action_scores, value
+        else:
+            # 随机性：添加高斯噪声
+            noise = torch.randn_like(action_scores) * 0.1
+            action_scores = action_scores + noise
+            return action_scores, value
 
 
-class ImprovedDQNAgent:
-    """改进的DQN智能体 - 支持Double DQN和优先级回放"""
+# ============================================================
+# PPO 训练器
+# ============================================================
+class PPOTrainer:
+    """PPO训练器"""
 
     def __init__(self,
                  state_dim: int,
-                 max_action_dim: int,
-                 lr: float = 1e-4,
+                 action_dim: int,
+                 lr: float = 3e-4,
                  gamma: float = 0.99,
-                 epsilon_start: float = 1.0,
-                 epsilon_end: float = 0.01,
-                 epsilon_decay: int = 10000,
-                 target_update_freq: int = 1000,
-                 use_double_dqn: bool = True,
-                 use_reward_norm: bool = True,
-                 local_explore_prob: float = 0.6,  # 新增参数
+                 gae_lambda: float = 0.95,
+                 clip_epsilon: float = 0.2,
+                 entropy_coef: float = 0.01,
+                 value_coef: float = 0.5,
+                 max_grad_norm: float = 0.5,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
 
-        self.state_dim = state_dim
-        self.max_action_dim = max_action_dim
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_start = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.target_update_freq = target_update_freq
-        self.use_double_dqn = use_double_dqn
-        self.use_reward_norm = use_reward_norm
         self.device = device
-        self.local_explore_prob = local_explore_prob  # 新增
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_epsilon = clip_epsilon
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.max_grad_norm = max_grad_norm
 
-        # Q网络和目标网络
-        self.q_network = ImprovedDQNNetwork(state_dim, max_action_dim).to(device)
-        self.target_network = ImprovedDQNNetwork(state_dim, max_action_dim).to(device)
-        self.target_network.load_state_dict(self.q_network.state_dict())
-        self.target_network.eval()
+        # 创建网络
+        self.network = ActorCriticNetwork(state_dim, action_dim).to(device)
 
-        # 优化器 - 使用AdamW
-        self.optimizer = optim.AdamW(self.q_network.parameters(), lr=lr, weight_decay=1e-5)
+        # 优化器
+        self.optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5)
 
         # 学习率调度器
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=1000, T_mult=2, eta_min=1e-6
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=100, gamma=0.95
         )
 
-        # 学习步数计数
-        self.learn_step_counter = 0
+        # 经验缓冲区
+        self.reset_buffer()
 
-        # Q值统计(用于监控)
-        self.q_values_history = deque(maxlen=1000)
+    def reset_buffer(self):
+        """重置经验缓冲区"""
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+        self.log_probs = []  # 虽然是连续动作，但我们记录为参考
 
-        # 奖励归一化器
-        self.reward_normalizer = RewardNormalizer() if use_reward_norm else None
-        self.optimal_tracker = OptimalPointTracker(max_action_dim)
+    def select_action(self, state, reachable_mask=None, deterministic=False):
+        """
+        选择动作
 
-    def select_action(self, state: np.ndarray, reachable_mask: np.ndarray,
-                      epsilon: float = None) -> np.ndarray:
-        """改进的动作选择 - 使用局部探索"""
-        if epsilon is None:
-            epsilon = self.epsilon
+        Returns:
+            action_scores: 动作分数
+            value: 状态价值
+        """
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
-        action_scores = np.full(len(reachable_mask), -1e9, dtype=np.float32)
-        reachable_indices = np.where(reachable_mask)[0]
+        with torch.no_grad():
+            action_scores, value = self.network.get_action(
+                state_tensor, reachable_mask, deterministic
+            )
 
-        if len(reachable_indices) == 0:
-            return action_scores
+        action_scores = action_scores.squeeze(0).cpu().numpy()
+        value = value.item()
 
-        if random.random() < epsilon:
-            # 探索模式
-            if random.random() < self.local_explore_prob:
-                # 局部探索: 基于历史最优点
-                explore_probs = self.optimal_tracker.get_exploration_distribution(
-                    reachable_mask, temperature=0.5
+        return action_scores, value
+
+    def store_transition(self, state, action, reward, value, done):
+        """存储转换"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.dones.append(done)
+
+    def compute_gae(self, next_value):
+        """
+        计算广义优势估计 (GAE)
+
+        Args:
+            next_value: 下一个状态的价值
+        """
+        advantages = []
+        gae = 0
+
+        values = self.values + [next_value]
+
+        # 从后向前计算GAE
+        for t in reversed(range(len(self.rewards))):
+            delta = (self.rewards[t] +
+                     self.gamma * values[t + 1] * (1 - self.dones[t]) -
+                     values[t])
+
+            gae = delta + self.gamma * self.gae_lambda * (1 - self.dones[t]) * gae
+            advantages.insert(0, gae)
+
+        # 计算回报
+        returns = [adv + val for adv, val in zip(advantages, self.values)]
+
+        return advantages, returns
+
+    def update(self, next_state, n_epochs=4, batch_size=64):
+        """
+        PPO更新
+
+        Args:
+            next_state: 最后一个状态
+            n_epochs: 更新轮数
+            batch_size: 批量大小
+        """
+        if len(self.states) < 2:
+            self.reset_buffer()
+            return {}
+
+        # 计算下一个状态的价值
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            _, next_value = self.network(next_state_tensor)
+            next_value = next_value.item()
+
+        # 计算GAE和回报
+        advantages, returns = self.compute_gae(next_value)
+
+        # 转换为tensor
+        states = torch.FloatTensor(np.array(self.states)).to(self.device)
+        actions = torch.FloatTensor(np.array(self.actions)).to(self.device)
+        old_values = torch.FloatTensor(self.values).to(self.device)
+        advantages = torch.FloatTensor(advantages).to(self.device)
+        returns = torch.FloatTensor(returns).to(self.device)
+
+        # 标准化优势
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 存储旧的动作分数用于计算KL散度
+        with torch.no_grad():
+            old_action_scores, _ = self.network(states)
+
+        # 多轮更新
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_entropy_loss = 0
+        total_loss = 0
+        n_updates = 0
+
+        for epoch in range(n_epochs):
+            # 小批量更新
+            indices = np.arange(len(self.states))
+            np.random.shuffle(indices)
+
+            for start in range(0, len(self.states), batch_size):
+                end = start + batch_size
+                batch_indices = indices[start:end]
+
+                # 获取批量数据
+                batch_states = states[batch_indices]
+                batch_actions = actions[batch_indices]
+                batch_old_values = old_values[batch_indices]
+                batch_advantages = advantages[batch_indices]
+                batch_returns = returns[batch_indices]
+                batch_old_scores = old_action_scores[batch_indices]
+
+                # 前向传播
+                action_scores, values = self.network(batch_states)
+                values = values.squeeze(-1)
+
+                # 策略损失 (使用MSE作为代理)
+                # 对于连续动作，我们直接优化动作分数与优势的对齐
+                policy_loss = -torch.mean(
+                    torch.sum(action_scores * batch_advantages.unsqueeze(-1), dim=-1)
                 )
 
-                if explore_probs.sum() > 0:
-                    # 从分布中采样
-                    try:
-                        action_scores[reachable_indices] = np.random.dirichlet(
-                            explore_probs[reachable_indices] * 10 + 0.1
-                        )
-                    except:
-                        # fallback
-                        action_scores[reachable_indices] = np.random.randn(len(reachable_indices))
-                else:
-                    action_scores[reachable_indices] = np.random.randn(len(reachable_indices))
-            else:
-                # 全局探索: 完全随机
-                action_scores[reachable_indices] = np.random.randn(len(reachable_indices))
-        else:
-            # 利用模式
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                q_values = self.q_network(state_tensor)[0]
-                action_scores = q_values.cpu().numpy()
-                action_scores[~reachable_mask] = -1e9
+                # 值函数损失
+                value_pred_clipped = batch_old_values + torch.clamp(
+                    values - batch_old_values,
+                    -self.clip_epsilon,
+                    self.clip_epsilon
+                )
+                value_loss1 = (values - batch_returns).pow(2)
+                value_loss2 = (value_pred_clipped - batch_returns).pow(2)
+                value_loss = 0.5 * torch.mean(torch.max(value_loss1, value_loss2))
 
-                valid_q = q_values[reachable_mask].cpu().numpy()
-                if len(valid_q) > 0:
-                    self.q_values_history.append(valid_q.mean())
+                # 熵正则化（鼓励探索）
+                entropy = torch.mean(torch.std(action_scores, dim=-1))
+                entropy_loss = -entropy
 
-        return action_scores
+                # 总损失
+                loss = (policy_loss +
+                        self.value_coef * value_loss +
+                        self.entropy_coef * entropy_loss)
 
-    def update_optimal_tracker(self, matching: Dict[int, int], step_reward: float):
-        """更新最优点追踪器"""
-        if len(matching) > 0:
-            point_indices = list(matching.values())
-            rewards = [step_reward / len(matching)] * len(matching)
-            self.optimal_tracker.update(point_indices, rewards)
+                # 反向传播
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.network.parameters(),
+                    self.max_grad_norm
+                )
+                self.optimizer.step()
 
-    def learn(self, batch: List[Transition], weights: np.ndarray) -> Tuple[float, np.ndarray]:
-        """
-        从经验回放中学习(改进版 - 带奖励归一化)
-        Returns:
-            loss, td_errors
-        """
-        batch_size = len(batch)
+                # 累积损失
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy_loss += entropy_loss.item()
+                total_loss += loss.item()
+                n_updates += 1
 
-        # 解包batch
-        states = torch.FloatTensor(np.array([t.state for t in batch])).to(self.device)
-        next_states = torch.FloatTensor(np.array([t.next_state for t in batch])).to(self.device)
-
-        # 奖励归一化
-        rewards_raw = [t.reward for t in batch]
-        if self.use_reward_norm and self.reward_normalizer:
-            rewards = torch.FloatTensor([self.reward_normalizer.normalize(r) for r in rewards_raw]).to(self.device)
-        else:
-            rewards = torch.FloatTensor(rewards_raw).to(self.device)
-
-        dones = torch.FloatTensor([t.done for t in batch]).to(self.device)
-        weights = torch.FloatTensor(weights).to(self.device)
-
-        # 提取动作和mask
-        actions = []
-        next_masks = []
-        for t in batch:
-            action_scores = t.action
-            reachable_mask = t.reachable_mask
-
-            # 找出实际选择的动作
-            masked_scores = action_scores.copy()
-            masked_scores[~reachable_mask] = -1e9
-            selected_action = np.argmax(masked_scores)
-            actions.append(selected_action)
-            next_masks.append(reachable_mask)
-
-        actions = torch.LongTensor(actions).to(self.device)
-
-        # 计算当前Q值
-        current_q_values = self.q_network(states)
-        current_q = current_q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-        # 计算目标Q值
-        with torch.no_grad():
-            if self.use_double_dqn:
-                # Double DQN: 使用在线网络选择动作,目标网络评估
-                next_q_online = self.q_network(next_states)
-                next_q_target = self.target_network(next_states)
-
-                # 为每个样本找最佳动作
-                max_next_q = []
-                for i in range(batch_size):
-                    mask = torch.BoolTensor(next_masks[i]).to(self.device)
-
-                    # 使用在线网络选择
-                    masked_q_online = next_q_online[i].clone()
-                    masked_q_online[~mask] = -1e9
-                    best_action = masked_q_online.argmax()
-
-                    # 使用目标网络评估
-                    max_next_q.append(next_q_target[i, best_action])
-
-                max_next_q = torch.stack(max_next_q)
-            else:
-                # 标准DQN
-                next_q_values = self.target_network(next_states)
-                max_next_q = []
-                for i in range(batch_size):
-                    mask = torch.BoolTensor(next_masks[i]).to(self.device)
-                    masked_q = next_q_values[i].clone()
-                    masked_q[~mask] = -1e9
-                    max_next_q.append(masked_q.max())
-                max_next_q = torch.stack(max_next_q)
-
-            # 使用Huber损失的目标(减少异常值影响)
-            target_q = rewards + (1 - dones) * self.gamma * max_next_q
-            target_q = torch.clamp(target_q, -100, 100)  # 限制目标Q值范围
-
-        # 计算TD误差
-        td_errors = (current_q - target_q).detach().cpu().numpy()
-
-        # 加权Huber损失
-        loss = F.smooth_l1_loss(current_q, target_q, reduction='none')
-        loss = (loss * weights).mean()
-
-        # 反向传播
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=10.0)
-
-        self.optimizer.step()
+        # 更新学习率
         self.scheduler.step()
 
-        # 软更新目标网络
-        self.learn_step_counter += 1
-        if self.learn_step_counter % self.target_update_freq == 0:
-            self._soft_update_target_network(tau=0.005)
+        # 清空缓冲区
+        self.reset_buffer()
 
-        return loss.item(), np.abs(td_errors)
-
-    def _soft_update_target_network(self, tau: float = 0.005):
-        """软更新目标网络"""
-        for target_param, param in zip(self.target_network.parameters(),
-                                       self.q_network.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-    def update_epsilon(self, step: int):
-        """更新探索率"""
-        self.epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
-                       np.exp(-1.0 * step / self.epsilon_decay)
-
-    def get_q_stats(self) -> Dict:
-        """获取Q值统计信息"""
-        if len(self.q_values_history) > 0:
-            return {
-                'mean_q': np.mean(self.q_values_history),
-                'std_q': np.std(self.q_values_history),
-                'max_q': np.max(self.q_values_history),
-                'min_q': np.min(self.q_values_history)
-            }
-        return {'mean_q': 0, 'std_q': 0, 'max_q': 0, 'min_q': 0}
-
-    def save(self, path: str):
-        """保存模型"""
-        checkpoint = {
-            'q_network': self.q_network.state_dict(),
-            'target_network': self.target_network.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'epsilon': self.epsilon,
-            'learn_step_counter': self.learn_step_counter
+        # 返回统计信息
+        return {
+            'policy_loss': total_policy_loss / n_updates,
+            'value_loss': total_value_loss / n_updates,
+            'entropy_loss': total_entropy_loss / n_updates,
+            'total_loss': total_loss / n_updates,
+            'learning_rate': self.optimizer.param_groups[0]['lr']
         }
 
-        # 保存奖励归一化器
-        if self.reward_normalizer:
-            checkpoint['reward_normalizer'] = {
-                'mean': self.reward_normalizer.mean,
-                'var': self.reward_normalizer.var,
-                'count': self.reward_normalizer.count
-            }
+    def save(self, path):
+        """保存模型"""
+        torch.save({
+            'network_state_dict': self.network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict()
+        }, path)
 
-        torch.save(checkpoint, path)
-
-    def load(self, path: str):
+    def load(self, path):
         """加载模型"""
         checkpoint = torch.load(path, map_location=self.device)
-        self.q_network.load_state_dict(checkpoint['q_network'])
-        self.target_network.load_state_dict(checkpoint['target_network'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.epsilon = checkpoint['epsilon']
-        self.learn_step_counter = checkpoint['learn_step_counter']
-
-        # 加载奖励归一化器
-        if 'reward_normalizer' in checkpoint and self.reward_normalizer:
-            self.reward_normalizer.mean = checkpoint['reward_normalizer']['mean']
-            self.reward_normalizer.var = checkpoint['reward_normalizer']['var']
-            self.reward_normalizer.count = checkpoint['reward_normalizer']['count']
+        self.network.load_state_dict(checkpoint['network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
 
-def set_global_seeds(seed: int):
-    """Set global random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def train_improved_dqn(
+# ============================================================
+# 训练函数
+# ============================================================
+def train_ppo(
         trajectory_file: str,
         region_file: str,
         dispatch_points_file: str,
         region_id: int = 0,
-        num_episodes: int = 100,
-        local_explore_prob: float = 0.7,  # 新增参数
+        num_episodes: int = 500,
         max_steps: int = 100,
+        update_interval: int = 10,  # 每N个episode更新一次
+        n_epochs: int = 4,
         batch_size: int = 64,
-        buffer_capacity: int = 100000,
-        learning_start: int = 100,
-        lr: float = 1e-4,
+        lr: float = 3e-4,
         gamma: float = 0.99,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.01,
-        epsilon_decay: int = 10000,
-        target_update_freq: int = 100,
-        save_freq: int = 100,
-        eval_interval: int = 50,
-        eval_episodes: int = 3,
-        eval_epsilon: float = 0.05,
-        state_dim: int = None,
-        use_double_dqn: bool = True,
-        use_prioritized_replay: bool = True,
-        use_reward_norm: bool = True,
+        gae_lambda: float = 0.95,
+        clip_epsilon: float = 0.2,
         log_dir: str = './logs',
         model_dir: str = './models',
         seed: int = config.random_seed
 ):
     """
-    改进的DQN训练主函数 - 带进度条和详细统计
+    使用PPO训练边缘调度器
     """
+    print("=" * 80)
+    print(f"{'PPO训练 - 区域 ' + str(region_id):^80}")
+    print("=" * 80)
+
     # 创建目录
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    # 统一设置随机种子
+    # 设置随机种子
     if seed is not None:
-        set_global_seeds(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    # 初始化TensorBoard
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    writer = SummaryWriter(os.path.join(log_dir, f'run_{timestamp}'))
-
-    # 初始化数据工厂并创建数据加载器
-    print("初始化数据加载器工厂...")
+    # 创建环境
+    print("\n初始化环境...")
     factory = DataLoaderFactory(
         trajectory_file=trajectory_file,
         region_file=region_file,
         dispatch_file=dispatch_points_file
     )
 
-    # 创建环境
-    print(f"创建区域 {region_id} 的环境...")
-    env = EdgeEnv(
-        region_id=region_id,
-        factory=factory,
-        max_steps=max_steps
-    )
+    env = EdgeEnv(region_id=region_id, factory=factory, max_steps=max_steps)
     if seed is not None:
         env.seed(seed)
 
-    # 根据环境的观测空间确定状态维度，避免手动配置失配
-    resolved_state_dim = env.observation_space.shape[0]
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-    # 创建智能体
-    print("创建改进的DQN智能体...")
-    agent = ImprovedDQNAgent(
-        state_dim=resolved_state_dim,
-        max_action_dim=env.num_dispatch_points,
+    print(f"✓ 状态维度: {state_dim}")
+    print(f"✓ 动作维度: {action_dim}")
+
+    # 创建训练器
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\n创建PPO训练器 (设备: {device})...")
+
+    trainer = PPOTrainer(
+        state_dim=state_dim,
+        action_dim=action_dim,
         lr=lr,
         gamma=gamma,
-        epsilon_start=epsilon_start,
-        epsilon_end=epsilon_end,
-        epsilon_decay=epsilon_decay,
-        target_update_freq=target_update_freq,
-        use_double_dqn=use_double_dqn,
-        use_reward_norm=use_reward_norm,
-        local_explore_prob=local_explore_prob  # 新增
+        gae_lambda=gae_lambda,
+        clip_epsilon=clip_epsilon,
+        device=device
     )
 
-    # 创建经验回放缓冲区
-    if use_prioritized_replay:
-        replay_buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
-        print("✓ 使用优先级经验回放")
-    else:
-        replay_buffer = deque(maxlen=buffer_capacity)
-        print("✓ 使用标准经验回放")
+    # TensorBoard
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    writer = SummaryWriter(f'{log_dir}/ppo_region_{region_id}_{timestamp}')
 
-    if use_reward_norm:
-        print("✓ 使用奖励归一化")
-    if use_double_dqn:
-        print("✓ 使用Double DQN")
-
-    # 训练循环统计
-    total_steps = 0
+    # 训练统计
     best_reward = -float('inf')
     best_success_rate = 0.0
-    reward_window = deque(maxlen=100)
-    success_rate_window = deque(maxlen=100)
-    wait_time_window = deque(maxlen=100)
-    total_expected_steps = num_episodes * max_steps
+    episode_rewards = deque(maxlen=100)
+    episode_success_rates = deque(maxlen=100)
+    episode_wait_times = deque(maxlen=100)
 
-    print("\n" + "=" * 100)
-    print(f"{'开始训练 - 区域 ' + str(region_id):^100}")
-    print("=" * 100)
-    print(
-        f"{'Episode':<10}{'Reward':<12}{'Avg(100)':<12}{'Success%':<12}{'AvgWait(min)':<15}{'ε':<10}")
-    print("-" * 100)
+    print("\n" + "=" * 80)
+    print("开始训练")
+    print("=" * 80)
+    print(f"{'Episode':<10}{'Reward':<12}{'Avg(100)':<12}{'Success%':<12}"
+          f"{'Wait(min)':<12}{'Loss':<10}")
+    print("-" * 80)
 
+    # 训练循环
     for episode in range(1, num_episodes + 1):
         state = env.reset()
         episode_reward = 0
-        episode_reward_raw = 0  # 未归一化的奖励
-        episode_losses = []
+        episode_steps = 0
 
+        # 收集轨迹
         for step in range(max_steps):
-            env.training_progress = min(1.0, total_steps / total_expected_steps)
-            # 获取当前可达点信息
-            point_result = env._extract_point_features()
-            reachable_indices = point_result.reachable_indices
+            # 更新训练进度
+            env.training_progress = min(1.0, episode / num_episodes)
 
-            # 构建reachable mask
+            # 获取可达掩码
+            point_result = env._extract_point_features()
             reachable_mask = np.zeros(env.num_dispatch_points, dtype=bool)
-            if len(reachable_indices) > 0:
-                reachable_mask[reachable_indices] = True
+            if len(point_result.reachable_indices) > 0:
+                reachable_mask[point_result.reachable_indices] = True
 
             # 选择动作
-            action = agent.select_action(state, reachable_mask)
+            action, value = trainer.select_action(state, reachable_mask)
 
             # 执行动作
             next_state, reward, done, info = env.step(action)
-            matching = info.get('matching', {})
-            agent.update_optimal_tracker(matching, reward)
-            # 更新奖励归一化器
-            if agent.reward_normalizer:
-                agent.reward_normalizer.update(reward)
 
-            episode_reward_raw += reward
+            # 存储转换
+            trainer.store_transition(state, action, reward, value, done)
 
-            # 存储经验
-            if use_prioritized_replay:
-                replay_buffer.push(state, action, next_state, reward, done, reachable_mask)
-            else:
-                replay_buffer.append(Transition(state, action, next_state, reward, done, reachable_mask))
-
+            episode_reward += reward
+            episode_steps += 1
             state = next_state
-            total_steps += 1
-
-            # 开始学习
-            if len(replay_buffer) >= learning_start and len(replay_buffer) >= batch_size:
-                if use_prioritized_replay:
-                    batch, indices, weights = replay_buffer.sample(batch_size)
-                    loss, td_errors = agent.learn(batch, weights)
-                    replay_buffer.update_priorities(indices, td_errors + 1e-6)
-                else:
-                    batch = random.sample(replay_buffer, batch_size)
-                    weights = np.ones(batch_size)
-                    loss, _ = agent.learn(batch, weights)
-
-                episode_losses.append(loss)
-
-                # 记录训练指标
-                if total_steps % 10 == 0:
-                    writer.add_scalar('Training/Loss', loss, total_steps)
-                    writer.add_scalar('Training/Epsilon', agent.epsilon, total_steps)
-                    writer.add_scalar('Training/Learning_Rate',
-                                      agent.optimizer.param_groups[0]['lr'], total_steps)
-
-                    q_stats = agent.get_q_stats()
-                    writer.add_scalar('Q_Values/Mean', q_stats['mean_q'], total_steps)
-                    writer.add_scalar('Q_Values/Std', q_stats['std_q'], total_steps)
-
-                    # 记录奖励归一化统计
-                    if agent.reward_normalizer:
-                        reward_stats = agent.reward_normalizer.get_stats()
-                        writer.add_scalar('Reward/Mean', reward_stats['mean'], total_steps)
-                        writer.add_scalar('Reward/Std', reward_stats['std'], total_steps)
-
-            agent.update_epsilon(total_steps)
 
             if done:
                 break
 
-        # Episode统计
-        episode_reward = episode_reward_raw  # 使用原始奖励显示
-        reward_window.append(episode_reward)
-        avg_reward_100 = np.mean(reward_window)
-        avg_loss = np.mean(episode_losses) if episode_losses else 0.0
+        # 定期更新
+        update_info = {}
+        if episode % update_interval == 0:
+            update_info = trainer.update(state, n_epochs=n_epochs, batch_size=batch_size)
 
-        # 计算性能指标
+        # 统计信息
         stats = info['episode_stats']
-        served = stats.get('served_requests', 0)
-        failed = stats.get('failed_requests', 0)
-        pending = info.get('pending_requests', 0)
+        served = stats['served_requests']
+        failed = stats['failed_requests']
+        pending = info['pending_requests']
         total_requests = served + failed + pending
         success_rate = (served / total_requests * 100) if total_requests > 0 else 0
 
-        # 计算平均等待时间
-        if stats.get('wait_time_count', 0) > 0:
+        if stats['wait_time_count'] > 0:
             avg_wait_time = stats['total_wait_time'] / stats['wait_time_count']
         else:
             avg_wait_time = 0.0
 
-        success_rate_window.append(success_rate)
-        wait_time_window.append(avg_wait_time)
-        avg_success_rate_100 = np.mean(success_rate_window)
-        avg_wait_time_100 = np.mean(wait_time_window)
+        # 更新滑动窗口
+        episode_rewards.append(episode_reward)
+        episode_success_rates.append(success_rate)
+        episode_wait_times.append(avg_wait_time)
 
         # 记录到TensorBoard
         writer.add_scalar('Episode/Reward', episode_reward, episode)
-        writer.add_scalar('Episode/Avg_Reward_100', avg_reward_100, episode)
-        writer.add_scalar('Episode/Avg_Loss', avg_loss, episode)
-        writer.add_scalar('Performance/Success_Rate', success_rate, episode)
-        writer.add_scalar('Performance/Avg_Success_Rate_100', avg_success_rate_100, episode)
-        writer.add_scalar('Performance/Avg_Wait_Time', avg_wait_time, episode)
-        writer.add_scalar('Performance/Avg_Wait_Time_100', avg_wait_time_100, episode)
-        writer.add_scalar('Performance/Served_Requests', served, episode)
-        writer.add_scalar('Performance/Failed_Requests', failed, episode)
+        writer.add_scalar('Episode/Success_Rate', success_rate, episode)
+        writer.add_scalar('Episode/Avg_Wait_Time', avg_wait_time, episode)
+        writer.add_scalar('Episode/Served', served, episode)
+        writer.add_scalar('Episode/Failed', failed, episode)
 
-        # MCS统计
-        total_mcs_income = sum(mcs.income for mcs in env.mcs_list)
-        total_mcs_distance = sum(mcs.total_distance_traveled for mcs in env.mcs_list)
-        busy_mcs = sum(1 for mcs in env.mcs_list if mcs.status.value != 'idle')
-        mcs_utilization = busy_mcs / len(env.mcs_list) * 100
+        if update_info:
+            writer.add_scalar('Loss/Policy', update_info['policy_loss'], episode)
+            writer.add_scalar('Loss/Value', update_info['value_loss'], episode)
+            writer.add_scalar('Loss/Entropy', update_info['entropy_loss'], episode)
+            writer.add_scalar('Loss/Total', update_info['total_loss'], episode)
+            writer.add_scalar('Training/Learning_Rate', update_info['learning_rate'], episode)
 
-        writer.add_scalar('MCS/Total_Income', total_mcs_income, episode)
-        writer.add_scalar('MCS/Total_Distance', total_mcs_distance, episode)
-        writer.add_scalar('MCS/Utilization', mcs_utilization, episode)
+        # 控制台输出
+        avg_reward = np.mean(episode_rewards)
+        loss_str = f"{update_info.get('total_loss', 0):.4f}" if update_info else "---"
 
-        print(f"{episode}/{num_episodes}"
-              f"{episode_reward:>10.2f} "
-              f"{avg_reward_100:>10.2f} {success_rate:>10.1f}% "
-              f"{avg_wait_time:>13.2f} {agent.epsilon:>8.3f} ")
+        print(f"{episode:<10}{episode_reward:>10.2f}{avg_reward:>10.2f}"
+              f"{success_rate:>10.1f}%{avg_wait_time:>10.2f}{loss_str:>10}")
 
-        # 保存最佳模型（基于奖励）
+        # 保存最佳模型
         if episode_reward > best_reward:
             best_reward = episode_reward
-            best_model_path = os.path.join(model_dir, f'best_reward_region_{region_id}.pth')
-            agent.save(best_model_path)
-            print(f"\n{'':>10}✓ 新最佳奖励模型! Avg Reward: {best_reward:.2f}")
+            save_path = f'{model_dir}/best_model_region_{region_id}.pth'
+            trainer.save(save_path)
+            writer.add_scalar('Best/Reward', best_reward, episode)
+
+        if success_rate > best_success_rate:
+            best_success_rate = success_rate
+            save_path = f'{model_dir}/best_success_region_{region_id}.pth'
+            trainer.save(save_path)
+            writer.add_scalar('Best/Success_Rate', best_success_rate, episode)
 
         # 定期保存检查点
-        if episode % save_freq == 0:
-            checkpoint_path = os.path.join(model_dir, f'checkpoint_ep{episode}_region_{region_id}.pth')
-            agent.save(checkpoint_path)
-            print(f"\n{'':>10}💾 检查点已保存: Episode {episode}")
-
-        # 每100个episode输出详细统计
         if episode % 100 == 0:
-            print("\n" + "-" * 100)
-            print(f"Episode {episode} 统计摘要:")
-            print(
-                f"  平均奖励(100): {avg_reward_100:.2f} | 成功率(100): {avg_success_rate_100:.1f}% | 等待时间(100): {avg_wait_time_100:.2f}min")
-            print(
-                f"  MCS总收入: ¥{total_mcs_income:.2f} | MCS利用率: {mcs_utilization:.1f}% | 总行驶距离: {total_mcs_distance:.2f}km")
-            if agent.reward_normalizer:
-                reward_stats = agent.reward_normalizer.get_stats()
-                print(f"  奖励统计: μ={reward_stats['mean']:.2f}, σ={reward_stats['std']:.2f}")
-            q_stats = agent.get_q_stats()
-            print(f"  Q值统计: μ={q_stats['mean_q']:.2f}, σ={q_stats['std_q']:.2f}")
-            print("-" * 100)
+            checkpoint_path = f'{model_dir}/checkpoint_ep{episode}_region_{region_id}.pth'
+            trainer.save(checkpoint_path)
+            print(f"\n{'':>10}💾 检查点已保存")
 
-        # 定期评估，以平滑展示随训练进程提升的成功率
-        if episode % eval_interval == 0:
-            eval_success, eval_reward, eval_wait = run_policy_evaluation(
-                env=env,
-                agent=agent,
-                max_steps=max_steps,
-                episodes=eval_episodes,
-                eval_epsilon=eval_epsilon
-            )
+            # 输出详细统计
+            print(f"{'':>10}📊 最近100轮统计:")
+            print(f"{'':>15}平均奖励: {np.mean(episode_rewards):.2f}")
+            print(f"{'':>15}平均成功率: {np.mean(episode_success_rates):.1f}%")
+            print(f"{'':>15}平均等待时间: {np.mean(episode_wait_times):.2f}分钟")
+            print()
 
-            writer.add_scalar('Eval/Success_Rate', eval_success, episode)
-            writer.add_scalar('Eval/Reward', eval_reward, episode)
-            writer.add_scalar('Eval/Avg_Wait_Time', eval_wait, episode)
-
-            print(
-                f"  [Eval every {eval_interval}] 成功率: {eval_success:.1f}% | "
-                f"奖励: {eval_reward:.2f} | 平均等待: {eval_wait:.2f}min"
-            )
-
-    # 保存最终模型
-    print()  # 换行
-    final_model_path = os.path.join(model_dir, f'final_model_region_{region_id}.pth')
-    agent.save(final_model_path)
+    # 训练完成
+    print("\n" + "=" * 80)
+    print("训练完成!")
+    print("=" * 80)
+    print(f"\n📈 最终统计 (最后100轮平均):")
+    print(f"  平均奖励: {np.mean(episode_rewards):.2f}")
+    print(f"  平均成功率: {np.mean(episode_success_rates):.2f}%")
+    print(f"  平均等待时间: {np.mean(episode_wait_times):.2f}分钟")
+    print(f"\n🏆 最佳记录:")
+    print(f"  最佳奖励: {best_reward:.2f}")
+    print(f"  最佳成功率: {best_success_rate:.2f}%")
+    print(f"\n💾 模型保存在: {model_dir}")
+    print(f"📊 日志保存在: {log_dir}")
+    print("=" * 80)
 
     writer.close()
 
-    print("\n" + "=" * 100)
-    print("训练完成!")
-    print(f"最佳平均奖励: {best_reward:.2f}")
-    print(f"最佳平均成功率: {best_success_rate:.1f}%")
-    print(f"最终模型: {final_model_path}")
-    print(f"TensorBoard: tensorboard --logdir={log_dir}")
-    print("=" * 100)
-
-    return agent, env
+    return trainer, env
 
 
+# ============================================================
+# 评估函数
+# ============================================================
+def evaluate_ppo(
+        model_path: str,
+        trajectory_file: str,
+        region_file: str,
+        dispatch_points_file: str,
+        region_id: int = 0,
+        n_episodes: int = 10,
+        max_steps: int = 100
+):
+    """评估训练好的PPO模型"""
+    print("\n" + "=" * 80)
+    print(f"{'评估PPO模型 - 区域 ' + str(region_id):^80}")
+    print("=" * 80)
+
+    # 创建环境
+    factory = DataLoaderFactory(
+        trajectory_file=trajectory_file,
+        region_file=region_file,
+        dispatch_file=dispatch_points_file
+    )
+
+    env = EdgeEnv(region_id=region_id, factory=factory, max_steps=max_steps)
+
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    # 加载模型
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    trainer = PPOTrainer(state_dim=state_dim, action_dim=action_dim, device=device)
+    trainer.load(model_path)
+
+    print(f"✓ 模型已加载: {model_path}")
+    print(f"\n开始评估 ({n_episodes} 轮)...")
+
+    # 评估
+    episode_rewards = []
+    episode_success_rates = []
+    episode_wait_times = []
+
+    for episode in range(n_episodes):
+        state = env.reset()
+        episode_reward = 0
+
+        for step in range(max_steps):
+            # 获取可达掩码
+            point_result = env._extract_point_features()
+            reachable_mask = np.zeros(env.num_dispatch_points, dtype=bool)
+            if len(point_result.reachable_indices) > 0:
+                reachable_mask[point_result.reachable_indices] = True
+
+            # 确定性动作
+            action, _ = trainer.select_action(state, reachable_mask, deterministic=True)
+
+            state, reward, done, info = env.step(action)
+            episode_reward += reward
+
+            if done:
+                break
+
+        # 统计
+        stats = info['episode_stats']
+        served = stats['served_requests']
+        failed = stats['failed_requests']
+        pending = info['pending_requests']
+        total = served + failed + pending
+        success_rate = (served / total * 100) if total > 0 else 0
+
+        if stats['wait_time_count'] > 0:
+            avg_wait = stats['total_wait_time'] / stats['wait_time_count']
+        else:
+            avg_wait = 0.0
+
+        episode_rewards.append(episode_reward)
+        episode_success_rates.append(success_rate)
+        episode_wait_times.append(avg_wait)
+
+        print(f"  Episode {episode + 1}/{n_episodes}: "
+              f"Reward={episode_reward:.2f}, "
+              f"Success={success_rate:.1f}%, "
+              f"Wait={avg_wait:.2f}min")
+
+    # 输出结果
+    print("\n" + "=" * 80)
+    print("评估结果")
+    print("=" * 80)
+    print(f"平均奖励: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+    print(f"平均成功率: {np.mean(episode_success_rates):.2f}% ± {np.std(episode_success_rates):.2f}%")
+    print(f"平均等待时间: {np.mean(episode_wait_times):.2f} ± {np.std(episode_wait_times):.2f} 分钟")
+    print("=" * 80)
+
+
+# ============================================================
+# 主函数
+# ============================================================
 if __name__ == '__main__':
-    # 配置参数
+    # 配置
     TRAJECTORY_FILE = 'dataset/top1000evs/reallocated/20140818_processed.csv'
-    REGION_FILE = 'dataset/fcs_voronoi_regions.geojson'
-    DISPATCH_POINTS_FILE = 'dataset/dispatch_points_400.csv'
+    REGION_FILE = 'dataset/fcs_regions.geojson'
+    DISPATCH_POINTS_FILE = 'dataset/dispatch_points.csv'
+    REGION_ID = 0
 
-    agent, env = train_improved_dqn(
+    # 训练
+    trainer, env = train_ppo(
         trajectory_file=TRAJECTORY_FILE,
         region_file=REGION_FILE,
         dispatch_points_file=DISPATCH_POINTS_FILE,
-        region_id=0,
+        region_id=REGION_ID,
         num_episodes=500,
         max_steps=100,
-        batch_size=128,
-        buffer_capacity=50000,
-        learning_start=500,
+        update_interval=10,  # 每10个episode更新一次
+        n_epochs=4,
+        batch_size=64,
         lr=3e-4,
-        gamma=0.99,
-        epsilon_start=1.0,
-        epsilon_end=0.05,
-        epsilon_decay=15000,
-        target_update_freq=500,
-        save_freq=100,
-        state_dim=128,
-        use_double_dqn=True,
-        use_prioritized_replay=True,
-        use_reward_norm=False,  # 启用奖励归一化
         log_dir='./logs',
         model_dir='./models'
+    )
+
+    # 评估
+    print("\n" + "=" * 80)
+    input("按Enter键开始评估...")
+
+    evaluate_ppo(
+        model_path=f'./models/best_model_region_{REGION_ID}.pth',
+        trajectory_file=TRAJECTORY_FILE,
+        region_file=REGION_FILE,
+        dispatch_points_file=DISPATCH_POINTS_FILE,
+        region_id=REGION_ID,
+        n_episodes=10,
+        max_steps=100
     )

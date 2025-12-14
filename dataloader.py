@@ -345,13 +345,3 @@ class DataLoaderFactory:
             self.region_manager,
             self.dispatch_manager
         )
-
-
-# 使用示例
-if __name__ == '__main__':
-    # 创建工厂
-    factory = DataLoaderFactory(
-        trajectory_file='dataset/top1000evs/reallocated/20140818_processed.csv',
-        region_file='dataset/fcs_voronoi_regions.geojson',
-        dispatch_file='dataset/dispatch_points_400.csv'
-    )

@@ -1,14 +1,13 @@
 import datetime
-
 import gym
 import numpy as np
 import random
-
 import torch
 from gym import spaces
 from typing import List, Tuple, Dict
 from dataclasses import dataclass
 from datetime import timedelta
+from collections import deque
 from dataloader import DataLoaderFactory
 from params_config import Config
 from charging_entities import MCS, MCSStatus, FCS, ChargingRequest, ChargingPile
@@ -20,10 +19,358 @@ config = Config()
 @dataclass
 class PointFeatureResult:
     """调度点特征提取的结果容器。"""
-
     reachable_indices: List[int]
 
 
+# ============================================================
+# 简化的调度追踪器
+# ============================================================
+class SimpleDispatchTracker:
+    """简化的调度追踪器 - 基于统计变化"""
+
+    def __init__(self, env):
+        self.env = env
+        self.last_served = 0
+        self.last_failed = 0
+        self.step_count = 0
+
+    def update(self, matching, step_reward):
+        """每步更新 - 使用启发式规则"""
+        current_served = self.env.episode_stats['served_requests']
+        current_failed = self.env.episode_stats['failed_requests']
+
+        # 计算本步的变化
+        delta_served = current_served - self.last_served
+        delta_failed = current_failed - self.last_failed
+
+        # 更新记录
+        self.last_served = current_served
+        self.last_failed = current_failed
+        self.step_count += 1
+
+        # 如果有调度动作
+        if len(matching) > 0:
+            # 计算平均响应时间（估计）
+            if self.env.episode_stats['wait_time_count'] > 0:
+                avg_response = (
+                        self.env.episode_stats['total_wait_time'] /
+                        self.env.episode_stats['wait_time_count']
+                )
+            else:
+                avg_response = 8.0  # 默认估计
+
+            # 为每个调度点更新历史
+            for mcs_idx, point_idx in matching.items():
+                # 启发式判断成功：
+                # 1. 如果有新服务的请求 -> 成功
+                # 2. 如果reward为正 -> 可能成功
+                # 3. 否则 -> 可能失败
+
+                if delta_served > 0:
+                    # 有新服务，按比例分配成功
+                    success_prob = delta_served / len(matching)
+                    is_success = (hash(f"{point_idx}_{self.step_count}") % 100) < (success_prob * 100)
+                    response_time = avg_response
+                elif step_reward > 0.1:
+                    # Reward为正，可能是好的调度
+                    is_success = True
+                    response_time = avg_response * 1.2
+                else:
+                    # 默认情况
+                    is_success = delta_failed == 0  # 如果没有新失败，算成功
+                    response_time = avg_response * 1.5
+
+                # 更新状态构建器
+                if hasattr(self.env, 'state_builder'):
+                    self.env.state_builder.update_point_history(
+                        point_idx,
+                        is_success,
+                        response_time
+                    )
+
+    def reset(self):
+        self.last_served = 0
+        self.last_failed = 0
+        self.step_count = 0
+
+
+# ============================================================
+# 增强的状态构建器
+# ============================================================
+class EnhancedStateBuilder:
+    """增强的状态构建器 - 提供更丰富的特征"""
+
+    def __init__(self, env):
+        self.env = env
+        self.grid_size = 10
+
+        # 历史统计
+        self.point_dispatch_history = {}  # {point_idx: [success, fail, total]}
+        self.point_response_times = {}  # {point_idx: deque of response times}
+
+        for i in range(env.num_dispatch_points):
+            self.point_dispatch_history[i] = [0, 0, 0]  # [成功, 失败, 总数]
+            self.point_response_times[i] = deque(maxlen=20)
+
+    def update_point_history(self, point_idx: int, success: bool, response_time: float):
+        """更新调度点历史"""
+        if point_idx >= len(self.point_dispatch_history):
+            return
+
+        if success:
+            self.point_dispatch_history[point_idx][0] += 1
+        else:
+            self.point_dispatch_history[point_idx][1] += 1
+        self.point_dispatch_history[point_idx][2] += 1
+
+        self.point_response_times[point_idx].append(response_time)
+
+    def get_point_features(self, point_idx: int) -> Dict:
+        """获取单个调度点的特征"""
+        point = self.env.dispatch_points[point_idx]
+        location = (point['longitude'], point['latitude'])
+
+        # 1. 计算附近的请求数量和紧急度
+        nearby_requests = 0
+        urgency_scores = []
+
+        for req in self.env.pending_requests:
+            distance = haversine_distance(
+                location[1], location[0],
+                req.location[1], req.location[0]
+            )
+
+            if distance <= 3.0:  # 3公里范围内
+                nearby_requests += 1
+                # 紧急度 = 等待时间 / 最大等待时间
+                wait_time = (self.env.current_time - req.request_time).total_seconds() / 60
+                urgency = min(wait_time / 15.0, 1.0)
+                urgency_scores.append(urgency)
+
+        avg_urgency = np.mean(urgency_scores) if urgency_scores else 0.0
+
+        # 2. 计算最近MCS距离和可达MCS数量
+        mcs_distances = []
+        reachable_mcs = 0
+
+        for mcs in self.env.mcs_list:
+            if mcs.status.value == "idle":
+                distance = haversine_distance(
+                    location[1], location[0],
+                    mcs.current_location[1], mcs.current_location[0]
+                )
+                mcs_distances.append(distance)
+
+                if distance <= config.MCS_SCHEDULE_R:
+                    reachable_mcs += 1
+
+        nearest_mcs_dist = min(mcs_distances) if mcs_distances else 10.0
+        is_reachable = reachable_mcs > 0
+
+        # 3. 历史特征
+        history = self.point_dispatch_history[point_idx]
+        success_rate = history[0] / max(history[2], 1)
+
+        response_times = list(self.point_response_times[point_idx])
+        avg_response = np.mean(response_times) if response_times else 0.0
+
+        return {
+            'nearby_requests': nearby_requests,
+            'nearest_mcs_distance': nearest_mcs_dist,
+            'avg_urgency': avg_urgency,
+            'historical_success_rate': success_rate,
+            'avg_response_time': avg_response,
+            'is_reachable': is_reachable,
+            'num_reachable_mcs': reachable_mcs
+        }
+
+    def build_enhanced_observation(self) -> np.ndarray:
+        """构建增强的观察状态"""
+        obs_parts = []
+
+        # ============ 部分1: 全局统计 (10维) ============
+        num_pending = len(self.env.pending_requests)
+        num_idle_mcs = sum(1 for mcs in self.env.mcs_list if mcs.status.value == "idle")
+        num_moving_mcs = sum(1 for mcs in self.env.mcs_list if mcs.status.value == "moving")
+        num_charging_mcs = sum(1 for mcs in self.env.mcs_list if mcs.status.value == "charging")
+
+        # FCS状态
+        fcs_available = len(self.env.fcs.get_available_piles())
+        fcs_total = len(self.env.fcs.charging_piles)
+        fcs_load = 1.0 - (fcs_available / fcs_total)
+
+        # 请求紧急度统计
+        urgency_scores = []
+        for req in self.env.pending_requests:
+            wait_time = (self.env.current_time - req.request_time).total_seconds() / 60
+            urgency = min(wait_time / 15.0, 1.0)
+            urgency_scores.append(urgency)
+
+        avg_urgency = np.mean(urgency_scores) if urgency_scores else 0.0
+        max_urgency = np.max(urgency_scores) if urgency_scores else 0.0
+
+        # 历史性能
+        served = self.env.episode_stats['served_requests']
+        failed = self.env.episode_stats['failed_requests']
+        total_req = served + failed
+        success_rate = served / max(total_req, 1)
+
+        global_features = [
+            num_pending / 20.0,
+            num_idle_mcs / len(self.env.mcs_list),
+            num_moving_mcs / len(self.env.mcs_list),
+            num_charging_mcs / len(self.env.mcs_list),
+            fcs_load,
+            avg_urgency,
+            max_urgency,
+            success_rate,
+            self.env.current_step / self.env.max_steps,
+            len(urgency_scores) / 20.0
+        ]
+
+        obs_parts.extend(global_features)
+
+        # ============ 部分2: 每个调度点的详细特征 (7维 * num_points) ============
+        point_features_list = []
+
+        for point_idx in range(self.env.num_dispatch_points):
+            features = self.get_point_features(point_idx)
+
+            point_features = [
+                min(features['nearby_requests'] / 5.0, 1.0),
+                np.clip(features['nearest_mcs_distance'] / 10.0, 0, 1),
+                features['avg_urgency'],
+                features['historical_success_rate'],
+                np.clip(features['avg_response_time'] / 10.0, 0, 1),
+                1.0 if features['is_reachable'] else 0.0,
+                min(features['num_reachable_mcs'] / 3.0, 1.0)
+            ]
+
+            point_features_list.extend(point_features)
+
+        obs_parts.extend(point_features_list)
+
+        # ============ 部分3: 空间热力图 (grid_size * grid_size * 2) ============
+        # 请求热力图
+        request_heatmap = self._build_request_heatmap()
+        obs_parts.extend(request_heatmap)
+
+        # MCS位置热力图
+        mcs_heatmap = self._build_mcs_heatmap()
+        obs_parts.extend(mcs_heatmap)
+
+        # ============ 部分4: MCS摘要特征 (5维) ============
+        mcs_summary = self._build_mcs_summary()
+        obs_parts.extend(mcs_summary)
+
+        # 转换为数组并进行安全处理
+        obs_array = np.array(obs_parts, dtype=np.float32)
+        obs_array = np.clip(obs_array, -10, 10)
+        obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        return obs_array
+
+    def _build_request_heatmap(self) -> List[float]:
+        """构建请求热力图 - 考虑紧急度加权"""
+        heatmap = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+
+        if not self.env.pending_requests:
+            return heatmap.flatten().tolist()
+
+        minx, miny, maxx, maxy = self.env.region_bounds
+        width = max(maxx - minx, 1e-6)
+        height = max(maxy - miny, 1e-6)
+
+        for req in self.env.pending_requests:
+            lon, lat = req.location
+            x_norm = np.clip((lon - minx) / width, 0, 0.999)
+            y_norm = np.clip((lat - miny) / height, 0, 0.999)
+            x_idx = int(x_norm * self.grid_size)
+            y_idx = int(y_norm * self.grid_size)
+
+            # 加权：紧急度越高，热力值越大
+            wait_time = (self.env.current_time - req.request_time).total_seconds() / 60
+            urgency_weight = 1.0 + min(wait_time / 15.0, 2.0)
+
+            heatmap[y_idx, x_idx] += urgency_weight
+
+        # 归一化
+        max_val = np.max(heatmap)
+        if max_val > 0:
+            heatmap = np.log1p(heatmap) / np.log1p(max_val)
+
+        return heatmap.flatten().tolist()
+
+    def _build_mcs_heatmap(self) -> List[float]:
+        """构建MCS位置热力图 - 显示空闲MCS分布"""
+        heatmap = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+
+        minx, miny, maxx, maxy = self.env.region_bounds
+        width = max(maxx - minx, 1e-6)
+        height = max(maxy - miny, 1e-6)
+
+        for mcs in self.env.mcs_list:
+            if mcs.status.value == "idle":
+                lon, lat = mcs.current_location
+                x_norm = np.clip((lon - minx) / width, 0, 0.999)
+                y_norm = np.clip((lat - miny) / height, 0, 0.999)
+                x_idx = int(x_norm * self.grid_size)
+                y_idx = int(y_norm * self.grid_size)
+
+                heatmap[y_idx, x_idx] += 1
+
+        # 归一化
+        max_val = np.max(heatmap)
+        if max_val > 0:
+            heatmap = heatmap / max_val
+
+        return heatmap.flatten().tolist()
+
+    def _build_mcs_summary(self) -> List[float]:
+        """构建MCS摘要特征"""
+        if self.env.mcs_list:
+            lons = [mcs.current_location[0] for mcs in self.env.mcs_list]
+            lats = [mcs.current_location[1] for mcs in self.env.mcs_list]
+            spatial_std = (np.std(lons) + np.std(lats)) / 2
+        else:
+            spatial_std = 0
+
+        total_income = sum(mcs.income for mcs in self.env.mcs_list)
+        avg_income = total_income / len(self.env.mcs_list) if self.env.mcs_list else 0
+
+        total_distance = sum(mcs.total_distance_traveled for mcs in self.env.mcs_list)
+        avg_distance = total_distance / len(self.env.mcs_list) if self.env.mcs_list else 0
+
+        # MCS状态多样性 (熵)
+        status_counts = {}
+        for mcs in self.env.mcs_list:
+            status = mcs.status.value
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        total_mcs = len(self.env.mcs_list)
+        status_entropy = 0
+        for count in status_counts.values():
+            p = count / total_mcs
+            status_entropy -= p * np.log(p + 1e-8)
+
+        return [
+            np.clip(spatial_std / 0.1, 0, 1),
+            np.clip(avg_income / 50, 0, 1),
+            np.clip(avg_distance / 20, 0, 1),
+            status_entropy / 2.0,
+            len(self.env.mcs_list) / 10
+        ]
+
+    def reset(self):
+        """重置历史统计"""
+        for i in range(self.env.num_dispatch_points):
+            self.point_dispatch_history[i] = [0, 0, 0]
+            self.point_response_times[i].clear()
+
+
+# ============================================================
+# MCS匹配器
+# ============================================================
 class MCSMatcher:
     def match_mcs_to_points_topk(
             self,
@@ -51,10 +398,8 @@ class MCSMatcher:
         matching = {}
         used_points = set()
 
-        # 随机顺序处理MCS
         mcs_order = np_random.permutation(available_mcs_indices).tolist()
-
-        explore_prob = np.clip(epsilon, 0.0, 1.0)
+        explore_prob = np.clip(epsilon * 0.7, 0.0, 0.7)
 
         for mcs_idx in mcs_order:
             mcs = mcs_list[mcs_idx]
@@ -67,22 +412,20 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            # 获取这些点的scores，不再限制为top-k，直接在全部可达点上退火抽样
             point_scores = [(p, float(action_scores[p])) for p in available_points]
-
             candidate_points = [p for p, _ in point_scores]
             candidate_scores = np.array([s for _, s in point_scores], dtype=float)
 
             if len(candidate_points) == 1:
                 selected_point = candidate_points[0]
             else:
-                # 高探索时温度大且加入均匀分布，初始几乎完全随机；
-                # 训练进度上升后逐渐由softmax分布主导。
-                temperature = 1.0 + 4.0 * explore_prob
+                temperature = 0.5 + 2.0 * explore_prob
                 stabilized = candidate_scores - np.max(candidate_scores)
-                score_probs = np.exp(stabilized / max(1e-6, temperature))
+                stabilized = np.clip(stabilized / max(1e-6, temperature), -10, 10)
+                score_probs = np.exp(stabilized)
                 score_sum = np.sum(score_probs)
-                if score_sum > 0:
+
+                if score_sum > 1e-8:
                     score_probs /= score_sum
                 else:
                     score_probs = np.ones_like(score_probs) / len(score_probs)
@@ -92,6 +435,7 @@ class MCSMatcher:
                 mix_probs /= np.sum(mix_probs)
 
                 selected_point = int(np_random.choice(candidate_points, p=mix_probs))
+
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
 
@@ -115,19 +459,18 @@ class MCSMatcher:
 
 def validate_action_scores(action_scores: np.ndarray) -> np.ndarray:
     """验证并修复action scores中的异常值"""
-    # 检查NaN
     if np.any(np.isnan(action_scores)):
-        print("Warning: NaN detected in action scores, replacing with zeros")
         action_scores = np.nan_to_num(action_scores, nan=0.0)
 
-    # 检查Inf
     if np.any(np.isinf(action_scores)):
-        print("Warning: Inf detected in action scores, clipping")
         action_scores = np.clip(action_scores, -10, 10)
 
     return action_scores
 
 
+# ============================================================
+# 主环境类
+# ============================================================
 class EdgeEnv(gym.Env):
 
     def __init__(self,
@@ -139,9 +482,7 @@ class EdgeEnv(gym.Env):
         self.np_random = None
 
         self.region_id = region_id
-
         self.data_loader = factory.create_dataloader()
-
         self.max_steps = max_steps
         self.num_mcs = config.MCS_PER_REGION
 
@@ -156,7 +497,7 @@ class EdgeEnv(gym.Env):
         self.region_bounds = self._get_region_bounds()
 
         # 观察空间: 在第一次 reset 后根据实际状态长度确定
-        self.grid_size = 10  # 网格大小
+        self.grid_size = 10
         self.observation_space = None
 
         # 初始化时间
@@ -171,10 +512,19 @@ class EdgeEnv(gym.Env):
 
         # 请求管理
         self.pending_requests = []
-        self.active_requests = {}  # {ev_id: ChargingRequest}
+        self.active_requests = {}
         self.served_ev_ids = set()
 
-        # 统计信息 - 只关注核心指标
+        # 奖励平滑缓冲区
+        self.reward_buffer = deque(maxlen=10)
+        self.success_rate_buffer = deque(maxlen=20)
+
+        # 统计追踪的稳定性
+        self.stats_ema_alpha = 0.1
+        self.ema_wait_time = 0.0
+        self.ema_success_rate = 0.0
+
+        # 统计信息
         self.episode_stats = {
             'served_requests': 0,
             'failed_requests': 0,
@@ -194,11 +544,15 @@ class EdgeEnv(gym.Env):
             shape=(self.num_dispatch_points,),
             dtype=np.float32
         )
-        self.training_progress = 0.0  # 0.0 到 1.0
+        self.training_progress = 0.0
+
+        # ===== 新增: 状态构建器和调度追踪器 =====
+        self.state_builder = EnhancedStateBuilder(self)
+        self.dispatch_tracker = SimpleDispatchTracker(self)
 
         self.reset()
 
-        # 在 reset 后补充 observation_space（依赖初始化后的状态长度）
+        # 在 reset 后补充 observation_space
         if self.observation_space is None:
             initial_obs = self._get_obs()
             self.observation_space = spaces.Box(
@@ -222,8 +576,6 @@ class EdgeEnv(gym.Env):
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-        # 关闭cuDNN的非确定性算法（保证完全复现）
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
@@ -256,7 +608,6 @@ class EdgeEnv(gym.Env):
             minx, miny, maxx, maxy = polygon.bounds
             return minx, miny, maxx, maxy
 
-        # 无法获取多边形时，基于调度点或区域中心兜底
         if self.dispatch_points:
             lons = [p['longitude'] for p in self.dispatch_points]
             lats = [p['latitude'] for p in self.dispatch_points]
@@ -267,91 +618,11 @@ class EdgeEnv(gym.Env):
         return center_lon - delta, center_lat - delta, center_lon + delta, center_lat + delta
 
     def _get_obs(self) -> np.ndarray:
-        """获取简化的观察状态"""
-        obs_parts = []
-
-        mcs_part = []
-        # MCS状态 (num_mcs * 3) 位置（经、纬度）、空闲状态
-        for mcs in self.mcs_list:
-            mcs_state = [
-                mcs.current_location[0],
-                mcs.current_location[1],
-                1.0 if mcs.status == MCSStatus.IDLE else 0.0  # 是否空闲
-            ]
-            mcs_part.extend(mcs_state)
-        num_idle_mcs = sum(1 for mcs in self.mcs_list if mcs.status == MCSStatus.IDLE)
-        mcs_part.append(num_idle_mcs / self.num_mcs)
-
-        obs_parts.extend(mcs_part)
-
-        # FCS相关状态 可用桩数、队列长队、预计排队时间
-        fcs_available_piles = len(self.fcs.get_available_piles())
-        # fcs_queuing_length = self.fcs.get_queue_length()
-        avg_fcs_wait = self.fcs.get_estimated_wait_time(self.current_time)
-        obs_parts.extend([fcs_available_piles / len(self.fcs.charging_piles),
-                          # fcs_queuing_length / config.EXPECTED_MAX_QUEUING_LENGTH,
-                          avg_fcs_wait / config.EXPECTED_MAX_FCS_WAIT_TIME])
-
-        # 请求热力图 (grid_size x grid_size)
-        heatmap = self._build_request_heatmap()
-        obs_parts.extend(heatmap)
-
-        # 区域级负载与需求状态 未服务请求数 平均等待时间
-        num_pending = len(self.pending_requests)
-
-        # 当前平均等待时间
-        if num_pending > 0:
-            current_avg_wait = np.mean([
-                (self.current_time - req.request_time).total_seconds() / 60
-                for req in self.pending_requests
-            ])
-        else:
-            current_avg_wait = 0.0
-
-        # 历史平均等待时间
-        if self.episode_stats['wait_time_count'] > 0:
-            historical_avg_wait = self.episode_stats['total_wait_time'] / self.episode_stats['wait_time_count']
-        else:
-            historical_avg_wait = 0.0
-
-        global_stats = [
-            num_pending / 20.0,  # 归一化待处理请求数
-            num_idle_mcs / self.num_mcs,  # 空闲MCS比例
-            fcs_available_piles / config.FCS_CHARGING_PILES,  # FCS可用桩比例
-            min(current_avg_wait / 30.0, 1.0),  # 当前平均等待时间(上限30分钟)
-            min(historical_avg_wait / 30.0, 1.0)  # 历史平均等待时间(上限30分钟)
-        ]
-
-        obs_parts.extend(global_stats)
-
-        return np.array(obs_parts, dtype=np.float32)
-
-    def _build_request_heatmap(self) -> List[float]:
-        """根据待处理请求生成归一化热力图"""
-        heatmap = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-
-        if not self.pending_requests:
-            return heatmap.flatten().tolist()
-
-        minx, miny, maxx, maxy = self.region_bounds
-        width = max(maxx - minx, 1e-6)
-        height = max(maxy - miny, 1e-6)
-
-        for req in self.pending_requests:
-            lon, lat = req.location
-            # 归一化到 [0, grid_size)
-            x_norm = (lon - minx) / width
-            y_norm = (lat - miny) / height
-            x_idx = int(np.clip(x_norm * self.grid_size, 0, self.grid_size - 1))
-            y_idx = int(np.clip(y_norm * self.grid_size, 0, self.grid_size - 1))
-            heatmap[y_idx, x_idx] += 1
-
-        # 归一化到 [0,1]
-        heatmap = heatmap / np.max(heatmap)
-        return heatmap.flatten().tolist()
+        """使用增强的状态构建器获取观察"""
+        return self.state_builder.build_enhanced_observation()
 
     def _extract_point_features(self) -> PointFeatureResult:
-        """提取当前可调度的调度点索引，用于构建动作可达掩码。"""
+        """提取当前可调度的调度点索引,用于构建动作可达掩码。"""
         reachable_indices = set()
 
         for mcs in self.mcs_list:
@@ -362,14 +633,15 @@ class EdgeEnv(gym.Env):
         return PointFeatureResult(reachable_indices=sorted(reachable_indices))
 
     def _compute_dispatch_epsilon(self) -> float:
-        """根据训练进度动态调整调度阶段的epsilon。"""
+        """根据训练进度动态调整调度阶段的epsilon - 使用更平滑的衰减"""
         progress = np.clip(self.training_progress, 0.0, 1.0)
-        return 1.0 - progress
+        return 1.0 - np.sqrt(progress)
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
         action = validate_action_scores(action)
         dispatch_epsilon = self._compute_dispatch_epsilon()
+
         # 1. 执行MCS调度
         matching = self.matcher.match_mcs_to_points_topk(
             self.mcs_list,
@@ -378,6 +650,7 @@ class EdgeEnv(gym.Env):
             self.np_random,
             epsilon=dispatch_epsilon
         )
+
         for mcs_idx, point_idx in matching.items():
             mcs = self.mcs_list[mcs_idx]
             point = self.dispatch_points[point_idx]
@@ -393,35 +666,36 @@ class EdgeEnv(gym.Env):
             mcs.start_movement(target_location, arrival_time, None)
             mcs.total_distance_traveled += distance
 
+        # 2-6. 环境更新步骤
         self._generate_charging_requests()
-
         self._update_mcs_status()
-
         self._process_charging_requests()
-
         self._update_fcs_status()
 
-        # 5. 更新时间和EV状态
+        # 7. 更新时间和EV状态
         self.current_step += 1
         self.current_time += timedelta(minutes=config.TIME_STEP)
         self.data_loader.update_ev_movement()
 
+        # 8. 计算稳定的奖励
+        reward = self._calculate_stable_reward()
 
-        # 7. 计算奖励
-        reward = self._calculate_simple_reward()
-
-        # 8. 获取新观察
+        # 9. 获取新观察
         obs = self._get_obs()
 
-        # 9. 检查是否结束
+        # 10. 检查是否结束
         done = self.current_step >= self.max_steps
 
-        # 10. 构建信息字典
+        # 11. 构建信息字典
         info = {
             'current_step': self.current_step,
             'pending_requests': len(self.pending_requests),
-            'episode_stats': self.episode_stats.copy()
+            'episode_stats': self.episode_stats.copy(),
+            'matching': matching
         }
+
+        # ===== 新增：更新调度追踪 =====
+        self.dispatch_tracker.update(matching, reward)
 
         return obs, reward, done, info
 
@@ -474,8 +748,6 @@ class EdgeEnv(gym.Env):
                 ev_state = self.data_loader.get_ev_state().get(request.ev_id)
                 if ev_state and ev_state.get('chose_fcs'):
                     self.episode_stats['failed_requests_fcs'] += 1
-                    # 从FCS队列中移除
-                    # self.fcs.remove_from_queue(request.ev_id, self.current_time)
                 else:
                     self.episode_stats['failed_requests_mcs'] += 1
 
@@ -493,20 +765,17 @@ class EdgeEnv(gym.Env):
             # 检查是否去FCS充电
             ev_state = self.data_loader.get_ev_state().get(request.ev_id)
             if ev_state and ev_state.get('chose_fcs'):
-                # EV选择了FCS
                 piles = self.fcs.charging_piles
                 for pile in piles:
                     if pile.estimated_finish_time is not None:
                         continue
                     if pile.is_occupied and pile.ev_id == request.ev_id:
-                        # 有可用充电桩，立即开始充电
                         self._start_fcs_charging(request.ev_id, pile)
                         served_requests.append(request)
-
-                        # 记录等待时间
                         self.episode_stats['total_wait_time'] += wait_time
                         self.episode_stats['wait_time_count'] += 1
                         continue
+
             # 尝试匹配MCS
             for mcs in self.mcs_list:
                 if mcs.status == MCSStatus.ASSIGNED and not mcs.assigned_ev:
@@ -526,7 +795,6 @@ class EdgeEnv(gym.Env):
                         )
                         mcs.assigned_ev = str(request.ev_id)
 
-                        # 记录等待时间
                         self.episode_stats['total_wait_time'] += wait_time
                         self.episode_stats['wait_time_count'] += 1
 
@@ -556,8 +824,7 @@ class EdgeEnv(gym.Env):
                         self.episode_stats['mcs_served'] += 1
 
     def _update_fcs_status(self):
-        """更新FCS状态(使用新的队列管理系统)"""
-        # 1. 检查并完成正在充电的桩
+        """更新FCS状态"""
         for pile in self.fcs.charging_piles:
             if pile.is_occupied and pile.estimated_finish_time:
                 if self.current_time >= pile.estimated_finish_time:
@@ -566,14 +833,12 @@ class EdgeEnv(gym.Env):
                         ev_state = self.data_loader.get_ev_state().get(ev_id)
 
                         if ev_state:
-                            # 记录等待时间(如果有请求时间)
                             if ev_state.get('charging_request_time'):
                                 wait_time = (pile.charging_start_time -
                                              ev_state['charging_request_time']).total_seconds() / 60
                                 self.episode_stats['total_wait_time'] += wait_time
                                 self.episode_stats['wait_time_count'] += 1
 
-                            # 更新电量
                             new_charge = min(
                                 ev_state['current_charge'] + pile.charge_amount,
                                 config.BATTERY_CAPACITY
@@ -588,8 +853,6 @@ class EdgeEnv(gym.Env):
                                 'chose_fcs': False
                             })
 
-                    # 释放充电桩
-                    pile_id = pile.pile_id
                     pile.is_occupied = False
                     pile.ev_id = None
                     pile.charging_start_time = None
@@ -612,12 +875,11 @@ class EdgeEnv(gym.Env):
         pile.estimated_finish_time = self.current_time + timedelta(minutes=charge_time)
         pile.charge_amount = charge_needed
 
-        # 更新EV状态
         self.data_loader.update_ev_state(ev_id, {
             'status': 'charging',
             'assigned_fcs': self.fcs.id,
             'charging_start_time': self.current_time,
-            'chose_fcs': True  # 保持标记
+            'chose_fcs': True
         })
 
     def _generate_charging_requests(self):
@@ -671,7 +933,6 @@ class EdgeEnv(gym.Env):
     def _simulate_ev_charging_choice(self, ev_id: int, ev_state: Dict, request: ChargingRequest):
         """模拟EV选择充电方式"""
         if not request.can_reach_fcs:
-            # 不能到达FCS，选择MCS
             point = self.data_loader.find_nearest_dispatch_point(
                 request.location[1], request.location[0], self.region_id
             )
@@ -682,19 +943,17 @@ class EdgeEnv(gym.Env):
                     'chose_fcs': False
                 })
         else:
-            # 可以到达FCS，有空位置直接选FCS
             total_piles = len(self.fcs.charging_piles)
             used_piles = total_piles - len(self.fcs.get_available_piles())
             load_ratio = used_piles / total_piles
+
             if load_ratio != 1:
-                # 选择FCS
                 self.data_loader.update_ev_state(ev_id, {
                     'target_charging_location': (self.fcs.location[1], self.fcs.location[0]),
                     'status': 'waiting',
                     'chose_fcs': True
                 })
 
-                # 扣除前往FCS的电量
                 fcs_distance = haversine_distance(
                     request.location[1], request.location[0],
                     self.fcs.location[1], self.fcs.location[0]
@@ -705,12 +964,11 @@ class EdgeEnv(gym.Env):
                 self.data_loader.update_ev_state(ev_id, {
                     'current_charge': new_charge
                 })
+
                 assigned_fcs = self.fcs.get_available_piles()[0]
                 assigned_fcs.is_occupied = True
                 assigned_fcs.ev_id = request.ev_id
-
             else:
-                # 选择MCS
                 point = self.data_loader.find_nearest_dispatch_point(
                     request.location[1], request.location[0], self.region_id
                 )
@@ -721,11 +979,11 @@ class EdgeEnv(gym.Env):
                         'chose_fcs': False
                     })
 
-    def _calculate_simple_reward(self) -> float:
-        """改进的稳定奖励函数"""
+    def _calculate_stable_reward(self) -> float:
+        """计算更稳定的奖励函数"""
         reward = 0.0
 
-        # 1. 增量式奖励 - 避免突变
+        # 1. 使用更平滑的增量奖励
         served = self.episode_stats['served_requests']
         failed = self.episode_stats['failed_requests']
 
@@ -736,39 +994,60 @@ class EdgeEnv(gym.Env):
         self._last_failed = failed
 
         # 2. 平滑的奖励组件
-        # 服务奖励 (主要激励)
-        service_reward = newly_served * 1.0
+        service_reward = np.sqrt(newly_served + 1) - 1
+        failure_penalty = newly_failed * 0.2
 
-        # 失败惩罚 (温和惩罚)
-        failure_penalty = newly_failed * 0.3
-
-        # 3. 等待时间惩罚 (归一化)
+        # 3. 使用归一化的等待时间惩罚
         if self.episode_stats['wait_time_count'] > 0:
             avg_wait = self.episode_stats['total_wait_time'] / self.episode_stats['wait_time_count']
-            wait_penalty = np.clip(avg_wait / 30.0, 0, 1.0) * 0.2
+            wait_penalty = 0.3 / (1 + np.exp(-0.1 * (avg_wait - 15)))
         else:
             wait_penalty = 0.0
 
-        # 4. MCS利用率奖励 (鼓励高效调度)
+        # 4. 更温和的MCS利用率激励
         num_idle_mcs = sum(1 for mcs in self.mcs_list if mcs.status == MCSStatus.IDLE)
         num_pending = len(self.pending_requests)
 
-        # 如果有请求但MCS空闲,给予轻微惩罚
         if num_pending > 0 and num_idle_mcs > 0:
-            idle_penalty = 0.1 * (num_idle_mcs / self.num_mcs)
+            idle_penalty = 0.05 * np.log1p(num_idle_mcs / max(self.num_mcs, 1))
         else:
             idle_penalty = 0.0
 
-        # 5. 组合奖励
-        reward = service_reward - failure_penalty - wait_penalty - idle_penalty
+        # 5. 添加成功率激励
+        total_requests = served + failed
+        if total_requests > 0:
+            current_success_rate = served / total_requests
+            self.success_rate_buffer.append(current_success_rate)
 
-        # 6. 平滑裁剪 - 避免极端值
-        reward = np.clip(reward, -2.0, 2.0)
+            if len(self.success_rate_buffer) > 5:
+                avg_success_rate = np.mean(self.success_rate_buffer)
+                if current_success_rate > avg_success_rate:
+                    success_bonus = 0.1
+                else:
+                    success_bonus = 0.0
+            else:
+                success_bonus = 0.0
+        else:
+            success_bonus = 0.0
 
-        return reward
+        # 6. 组合奖励
+        raw_reward = service_reward - failure_penalty - wait_penalty - idle_penalty + success_bonus
+
+        # 7. 使用移动平均平滑奖励
+        self.reward_buffer.append(raw_reward)
+        if len(self.reward_buffer) > 1:
+            smoothed_reward = np.mean(self.reward_buffer)
+        else:
+            smoothed_reward = raw_reward
+
+        # 8. 使用更温和的裁剪
+        final_reward = np.clip(smoothed_reward, -1.5, 1.5)
+
+        return final_reward
 
     def reset(self) -> np.ndarray:
         """重置环境"""
+        # 打印统计信息
         served = self.episode_stats['served_requests']
         failed = self.episode_stats['failed_requests']
         failed_requests_fcs = self.episode_stats['failed_requests_fcs']
@@ -776,17 +1055,29 @@ class EdgeEnv(gym.Env):
         total = served + failed + len(self.pending_requests)
         mcs_served = self.episode_stats['mcs_served']
         fcs_served = self.episode_stats['fcs_served']
-        print(f"region_id:{self.region_id} served:{served}, fcs_served:{fcs_served}, mcs_served:{mcs_served}, total:{total}, "
+
+        print(f"region_id:{self.region_id} served:{served}, fcs_served:{fcs_served}, "
+              f"mcs_served:{mcs_served}, total:{total}, "
               f"failed_requests_fcs:{failed_requests_fcs}, failed_requests_mcs:{failed_requests_mcs}")
 
+        # 重置时间
         self.current_step = 0
         self.current_time = self.start_time
+
+        # 重置请求管理
         self.pending_requests = []
         self.active_requests = {}
         self.served_ev_ids = set()
         self._last_served = 0
         self._last_failed = 0
 
+        # 重置平滑缓冲区
+        self.reward_buffer.clear()
+        self.success_rate_buffer.clear()
+        self.ema_wait_time = 0.0
+        self.ema_success_rate = 0.0
+
+        # 重置数据加载器
         self.data_loader.reset_ev_states()
 
         # 重置MCS
@@ -797,14 +1088,13 @@ class EdgeEnv(gym.Env):
             mcs.total_distance_traveled = 0.0
             mcs.income = 0.0
 
-        # 重置FCS(包括新的队列管理)
+        # 重置FCS
         for pile in self.fcs.charging_piles:
             pile.is_occupied = False
             pile.ev_id = None
             pile.charging_start_time = None
             pile.estimated_finish_time = None
             pile.charge_amount = 0
-        self.fcs.waiting_queue = []  # 清空队列
 
         # 重置统计
         self.episode_stats = {
@@ -813,11 +1103,14 @@ class EdgeEnv(gym.Env):
             'failed_requests_fcs': 0,
             'failed_requests_mcs': 0,
             'timeout_requests': 0,
-            'total_wait_time': 0.0,
+            'total_wait_time': 0,
             'wait_time_count': 0,
             'mcs_served': 0,
             'fcs_served': 0
-        }
+            }
+        # ===== 新增：重置状态构建器和追踪器 =====
+        self.state_builder.reset()
+        self.dispatch_tracker.reset()
 
         return self._get_obs()
 
@@ -831,14 +1124,12 @@ class EdgeEnv(gym.Env):
         return (served / total * 100) if total > 0 else 0.0
 
     def get_success_served(self) -> int:
-        served = self.episode_stats['served_requests']
-        return served
+        return self.episode_stats['served_requests']
 
     def get_avg_wait_time(self) -> float:
         total_wait = self.episode_stats['total_wait_time']
         count = self.episode_stats['wait_time_count']
 
-        # 加上当前正在等待的请求
         if len(self.pending_requests) > 0:
             current_waits = [
                 (self.current_time - req.request_time).total_seconds() / 60
