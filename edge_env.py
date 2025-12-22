@@ -4,7 +4,7 @@ import numpy as np
 import random
 import torch
 from gym import spaces
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from datetime import timedelta
 from collections import deque
