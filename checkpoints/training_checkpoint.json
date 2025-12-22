@@ -1,0 +1,104 @@
+{
+  "region_status": {
+    "0": "training",
+    "1": "training",
+    "2": "training",
+    "3": "training",
+    "4": "completed",
+    "5": "completed",
+    "6": "completed",
+    "7": "completed",
+    "8": "completed",
+    "9": "completed",
+    "10": "training",
+    "11": "pending",
+    "12": "pending",
+    "13": "pending",
+    "14": "pending",
+    "15": "pending",
+    "16": "pending",
+    "17": "pending"
+  },
+  "region_progress": {
+    "0": 0,
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 500,
+    "5": 500,
+    "6": 500,
+    "7": 500,
+    "8": 500,
+    "9": 500,
+    "10": 200,
+    "11": 0,
+    "12": 0,
+    "13": 0,
+    "14": 0,
+    "15": 0,
+    "16": 0,
+    "17": 0
+  },
+  "region_metrics": {
+    "0": {},
+    "1": {},
+    "2": {},
+    "3": {},
+    "4": {
+      "final_reward": 6.13459018702203,
+      "final_success_rate": 77.6585131591828,
+      "best_reward": 22.42912427679348,
+      "best_success_rate": 100.0,
+      "completed": true
+    },
+    "5": {
+      "final_reward": 0.0,
+      "final_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0,
+      "completed": true
+    },
+    "6": {
+      "final_reward": 0.0,
+      "final_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0,
+      "completed": true
+    },
+    "7": {
+      "final_reward": 0.0,
+      "final_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0,
+      "completed": true
+    },
+    "8": {
+      "final_reward": 0.0,
+      "final_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0,
+      "completed": true
+    },
+    "9": {
+      "final_reward": 0.0,
+      "final_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0,
+      "completed": true
+    },
+    "10": {
+      "avg_reward": 0.0,
+      "avg_success_rate": 0.0,
+      "best_reward": 0.0,
+      "best_success_rate": 0.0
+    },
+    "11": {},
+    "12": {},
+    "13": {},
+    "14": {},
+    "15": {},
+    "16": {},
+    "17": {}
+  },
+  "timestamp": "2025-12-15T18:36:07.150326"
+}

@@ -663,12 +663,12 @@ if __name__ == '__main__':
         region_file=REGION_FILE,
         dispatch_points_file=DISPATCH_POINTS_FILE,
         region_id=REGION_ID,
-        num_episodes=500,
+        num_episodes=1000,
         max_steps=100,
         update_interval=10,  # 每10个episode更新一次
         n_epochs=4,
-        batch_size=64,
-        lr=3e-4,
+        batch_size=256,
+        lr=1e-4,
         log_dir='./logs',
         model_dir='./models'
     )

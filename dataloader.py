@@ -105,7 +105,8 @@ class DispatchPointManager:
                 'id': f'fallback_{region_id}',
                 'longitude': center_lon,
                 'latitude': center_lat,
-                'region_id': region_id
+                'region_id': region_id,
+                'mcs_count': 0
             }]
 
         return region_points.to_dict('records')

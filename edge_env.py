@@ -229,35 +229,35 @@ class EnhancedStateBuilder:
         ]
 
         obs_parts.extend(global_features)
-
-        # ============ 部分2: 每个调度点的详细特征 (7维 * num_points) ============
-        point_features_list = []
-
-        for point_idx in range(self.env.num_dispatch_points):
-            features = self.get_point_features(point_idx)
-
-            point_features = [
-                min(features['nearby_requests'] / 5.0, 1.0),
-                np.clip(features['nearest_mcs_distance'] / 10.0, 0, 1),
-                features['avg_urgency'],
-                features['historical_success_rate'],
-                np.clip(features['avg_response_time'] / 10.0, 0, 1),
-                1.0 if features['is_reachable'] else 0.0,
-                min(features['num_reachable_mcs'] / 3.0, 1.0)
-            ]
-
-            point_features_list.extend(point_features)
-
-        obs_parts.extend(point_features_list)
+        #
+        # # ============ 部分2: 每个调度点的详细特征 (7维 * num_points) ============
+        # point_features_list = []
+        #
+        # for point_idx in range(self.env.num_dispatch_points):
+        #     features = self.get_point_features(point_idx)
+        #
+        #     point_features = [
+        #         min(features['nearby_requests'] / 5.0, 1.0),
+        #         np.clip(features['nearest_mcs_distance'] / 10.0, 0, 1),
+        #         features['avg_urgency'],
+        #         features['historical_success_rate'],
+        #         np.clip(features['avg_response_time'] / 10.0, 0, 1),
+        #         1.0 if features['is_reachable'] else 0.0,
+        #         min(features['num_reachable_mcs'] / 3.0, 1.0)
+        #     ]
+        #
+        #     point_features_list.extend(point_features)
+        #
+        # obs_parts.extend(point_features_list)
 
         # ============ 部分3: 空间热力图 (grid_size * grid_size * 2) ============
         # 请求热力图
-        request_heatmap = self._build_request_heatmap()
-        obs_parts.extend(request_heatmap)
-
-        # MCS位置热力图
-        mcs_heatmap = self._build_mcs_heatmap()
-        obs_parts.extend(mcs_heatmap)
+        # request_heatmap = self._build_request_heatmap()
+        # obs_parts.extend(request_heatmap)
+        #
+        # # MCS位置热力图
+        # mcs_heatmap = self._build_mcs_heatmap()
+        # obs_parts.extend(mcs_heatmap)
 
         # ============ 部分4: MCS摘要特征 (5维) ============
         mcs_summary = self._build_mcs_summary()
@@ -493,8 +493,8 @@ class EdgeEnv(gym.Env):
         self._last_failed = 0
         self.matcher = MCSMatcher()
 
-        # 区域边界用于请求热力图
-        self.region_bounds = self._get_region_bounds()
+        self.point_ema = np.zeros(len(self.dispatch_points))  # shape = (20,)
+        self.point_count = np.zeros(len(self.dispatch_points))  # 当前 step 的请求计数
 
         # 观察空间: 在第一次 reset 后根据实际状态长度确定
         self.grid_size = 10
@@ -697,6 +697,7 @@ class EdgeEnv(gym.Env):
         # ===== 新增：更新调度追踪 =====
         self.dispatch_tracker.update(matching, reward)
 
+        self.update_ema()
         return obs, reward, done, info
 
     def _update_mcs_status(self):
@@ -942,6 +943,7 @@ class EdgeEnv(gym.Env):
                     'status': 'waiting',
                     'chose_fcs': False
                 })
+                self.point_count[point['id']] += 1
         else:
             total_piles = len(self.fcs.charging_piles)
             used_piles = total_piles - len(self.fcs.get_available_piles())
@@ -978,6 +980,21 @@ class EdgeEnv(gym.Env):
                         'status': 'waiting',
                         'chose_fcs': False
                     })
+                self.point_count[point['id']] += 1
+
+    def update_ema(self):
+        alpha = 0.2
+        self.point_ema = (
+                alpha * self.point_count
+                + (1 - alpha) * self.point_ema
+        )
+        self.point_count[:] = 0  # 清空，准备下一个 step
+
+    def score_point(self, p):
+        demand = self.point_ema[p]
+        supply = self.nearby_mcs_count[p]  # 或同一簇已有车数
+        cluster = self.cluster_count[p]  # 可与 supply 合并
+        return demand - 0.8 * supply - 0.5 * cluster
 
     def _calculate_stable_reward(self) -> float:
         """计算更稳定的奖励函数"""
