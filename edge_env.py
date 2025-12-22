@@ -875,11 +875,9 @@ class EdgeEnv(gym.Env):
 
     def _calculate_stable_reward(self) -> float:
         """计算更稳定的奖励函数"""
-        reward = 0.0
-
-        # 1. 使用更平滑的增量奖励
         served = self.episode_stats['served_requests']
         failed = self.episode_stats['failed_requests']
+        total_handled = served + failed
 
         newly_served = served - self._last_served
         newly_failed = failed - self._last_failed
@@ -887,57 +885,50 @@ class EdgeEnv(gym.Env):
         self._last_served = served
         self._last_failed = failed
 
-        # 2. 平滑的奖励组件
-        service_reward = np.sqrt(newly_served + 1) - 1
-        failure_penalty = newly_failed * 0.2
+        # 基础服务/失败分
+        service_reward = 0.6 * newly_served
+        failure_penalty = 0.4 * newly_failed
 
-        # 3. 使用归一化的等待时间惩罚
+        # 等待时间EMA惩罚
         if self.episode_stats['wait_time_count'] > 0:
             avg_wait = self.episode_stats['total_wait_time'] / self.episode_stats['wait_time_count']
-            wait_penalty = 0.3 / (1 + np.exp(-0.1 * (avg_wait - 15)))
         else:
-            wait_penalty = 0.0
+            avg_wait = 0.0
+        self.ema_wait_time = 0.3 * avg_wait + 0.7 * self.ema_wait_time
+        wait_penalty = 0.5 * np.tanh(self.ema_wait_time / 30.0)
 
-        # 4. 更温和的MCS利用率激励
-        num_idle_mcs = sum(1 for mcs in self.mcs_list if mcs.status == MCSStatus.IDLE)
+        # 成功率EMA激励
+        denom = total_handled + len(self.pending_requests)
+        current_success = served / denom if denom > 0 else 0.0
+        self.ema_success_rate = 0.2 * current_success + 0.8 * self.ema_success_rate
+        success_bonus = 0.5 * (self.ema_success_rate - 0.5)
+
+        # 供需平衡惩罚（平均正向缺口）
+        gap = np.maximum(self.point_ema - self.nearby_mcs_count, 0)
+        avg_gap = np.mean(gap) if len(gap) > 0 else 0.0
+        gap_penalty = 0.3 * np.tanh(avg_gap / 10.0)
+
+        # 空闲惩罚：有待处理但MCS空闲
+        num_idle = sum(1 for mcs in self.mcs_list if mcs.status == MCSStatus.IDLE)
         num_pending = len(self.pending_requests)
+        idle_penalty = 0.0
+        if num_pending > 0 and num_idle > 0:
+            idle_ratio = num_idle / max(self.num_mcs, 1)
+            idle_penalty = 0.2 * idle_ratio
 
-        if num_pending > 0 and num_idle_mcs > 0:
-            idle_penalty = 0.05 * np.log1p(num_idle_mcs / max(self.num_mcs, 1))
-        else:
-            idle_penalty = 0.0
+        raw_reward = (
+                service_reward
+                - failure_penalty
+                - wait_penalty
+                - gap_penalty
+                - idle_penalty
+                + success_bonus
+        )
 
-        # 5. 添加成功率激励
-        total_requests = served + failed
-        if total_requests > 0:
-            current_success_rate = served / total_requests
-            self.success_rate_buffer.append(current_success_rate)
-
-            if len(self.success_rate_buffer) > 5:
-                avg_success_rate = np.mean(self.success_rate_buffer)
-                if current_success_rate > avg_success_rate:
-                    success_bonus = 0.1
-                else:
-                    success_bonus = 0.0
-            else:
-                success_bonus = 0.0
-        else:
-            success_bonus = 0.0
-
-        # 6. 组合奖励
-        raw_reward = service_reward - failure_penalty - wait_penalty - idle_penalty + success_bonus
-
-        # 7. 使用移动平均平滑奖励
+        # 平滑与裁剪
         self.reward_buffer.append(raw_reward)
-        if len(self.reward_buffer) > 1:
-            smoothed_reward = np.mean(self.reward_buffer)
-        else:
-            smoothed_reward = raw_reward
-
-        # 8. 使用更温和的裁剪
-        final_reward = np.clip(smoothed_reward, -1.5, 1.5)
-
-        return final_reward
+        smoothed_reward = np.mean(self.reward_buffer)
+        return float(np.clip(smoothed_reward, -2.0, 2.0))
 
     def reset(self) -> np.ndarray:
         """重置环境"""
