@@ -393,7 +393,7 @@ def train_ppo(
         env.seed(seed)
 
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
 
     print(f"✓ 状态维度: {state_dim}")
     print(f"✓ 动作维度: {action_dim}")
@@ -580,7 +580,7 @@ def evaluate_ppo(
     env = EdgeEnv(region_id=region_id, factory=factory, max_steps=max_steps)
 
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
 
     # 加载模型
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
