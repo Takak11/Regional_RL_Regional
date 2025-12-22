@@ -167,7 +167,7 @@ def train_ppo_multiday(
     print("\n获取环境维度...")
     temp_env, _ = data_manager.create_env(region_id, max_steps, day_index=0)
     state_dim = temp_env.observation_space.shape[0]
-    action_dim = temp_env.action_space.shape[0]
+    action_dim = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
     print(f"✓ 状态维度: {state_dim}")
     print(f"✓ 动作维度: {action_dim}")
 
@@ -382,7 +382,7 @@ def evaluate_multiday(
     # 获取维度
     temp_env, _ = data_manager.create_env(region_id, max_steps, 0)
     state_dim = temp_env.observation_space.shape[0]
-    action_dim = temp_env.action_space.shape[0]
+    action_dim = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
 
     # 加载模型
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
