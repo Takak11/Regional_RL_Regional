@@ -90,8 +90,8 @@ class ActorCriticNetwork(nn.Module):
         """
         action_scores, value = self.forward(state)
 
-        if reachable_mask is not None:
-            # 对不可达的点设置极小值
+        if reachable_mask is not None and reachable_mask.shape[-1] == action_scores.shape[-1]:
+            # 对不可达的点设置极小值（仅在维度匹配时启用）
             reachable_mask = torch.FloatTensor(reachable_mask).to(action_scores.device)
             action_scores = action_scores * reachable_mask + (1 - reachable_mask) * (-1e9)
 
