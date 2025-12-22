@@ -242,15 +242,14 @@ class EnhancedStateBuilder:
 # MCS匹配器
 # ============================================================
 class MCSMatcher:
-    def match_mcs_to_points_topk(
+    def match_mcs_to_points(
             self,
             mcs_list: List,
             dispatch_points: List[Dict],
             action_scores: np.ndarray,
-            np_random,
-            k: int = 3,
-            epsilon: float = 1.0
+            np_random=None
     ) -> Dict[int, int]:
+        """为空闲MCS分配分数最高的可达调度点"""
         available_mcs_indices = [
             i for i, mcs in enumerate(mcs_list)
             if mcs.status.value == "idle"
@@ -268,11 +267,12 @@ class MCSMatcher:
         matching = {}
         used_points = set()
 
-        mcs_order = np_random.permutation(available_mcs_indices).tolist()
-        explore_prob = np.clip(epsilon * 0.7, 0.0, 0.7)
+        if np_random is not None:
+            mcs_order = np_random.permutation(available_mcs_indices).tolist()
+        else:
+            mcs_order = list(available_mcs_indices)
 
         for mcs_idx in mcs_order:
-            mcs = mcs_list[mcs_idx]
             reachable = mcs_reachable_map[mcs_idx]
 
             if not reachable:
@@ -282,29 +282,14 @@ class MCSMatcher:
             if not available_points:
                 continue
 
-            point_scores = [(p, float(action_scores[p])) for p in available_points]
-            candidate_points = [p for p, _ in point_scores]
-            candidate_scores = np.array([s for _, s in point_scores], dtype=float)
+            scores = np.array([action_scores[p] for p in available_points])
+            max_score = np.max(scores)
+            best_points = [p for p, s in zip(available_points, scores) if s == max_score]
 
-            if len(candidate_points) == 1:
-                selected_point = candidate_points[0]
+            if np_random is not None and len(best_points) > 1:
+                selected_point = int(np_random.choice(best_points))
             else:
-                temperature = 0.5 + 2.0 * explore_prob
-                stabilized = candidate_scores - np.max(candidate_scores)
-                stabilized = np.clip(stabilized / max(1e-6, temperature), -10, 10)
-                score_probs = np.exp(stabilized)
-                score_sum = np.sum(score_probs)
-
-                if score_sum > 1e-8:
-                    score_probs /= score_sum
-                else:
-                    score_probs = np.ones_like(score_probs) / len(score_probs)
-
-                uniform_probs = np.ones_like(score_probs) / len(score_probs)
-                mix_probs = explore_prob * uniform_probs + (1 - explore_prob) * score_probs
-                mix_probs /= np.sum(mix_probs)
-
-                selected_point = int(np_random.choice(candidate_points, p=mix_probs))
+                selected_point = int(best_points[0])
 
             matching[mcs_idx] = selected_point
             used_points.add(selected_point)
@@ -325,17 +310,6 @@ class MCSMatcher:
                 reachable.append(idx)
 
         return reachable
-
-
-def validate_action_scores(action_scores: np.ndarray) -> np.ndarray:
-    """验证并修复action scores中的异常值"""
-    if np.any(np.isnan(action_scores)):
-        action_scores = np.nan_to_num(action_scores, nan=0.0)
-
-    if np.any(np.isinf(action_scores)):
-        action_scores = np.clip(action_scores, -10, 10)
-
-    return action_scores
 
 
 # ============================================================
@@ -490,26 +464,6 @@ class EdgeEnv(gym.Env):
         """使用增强的状态构建器获取观察"""
         return self.state_builder.build_enhanced_observation()
 
-    def _select_patrol_targets(self) -> Dict[int, Optional[int]]:
-        """巡逻策略: 每个空闲MCS随机选择可达调度点或保持不动"""
-        targets = {}
-        idle_indices = [
-            i for i, mcs in enumerate(self.mcs_list)
-            if mcs.status == MCSStatus.IDLE
-        ]
-
-        for mcs_idx in idle_indices:
-            reachable = self.matcher._get_reachable_points(self.mcs_list[mcs_idx], self.dispatch_points)
-            if not reachable:
-                continue
-
-            # 可选择不动（None），与所有可达点等概率
-            choices = reachable + [None]
-            chosen = self.np_random.choice(choices)
-            if chosen is not None:
-                targets[mcs_idx] = chosen
-        return targets
-
     def _build_mode_scores(self, mode: int) -> np.ndarray:
         """根据模式生成调度点得分"""
         if mode == 1:
@@ -534,11 +488,6 @@ class EdgeEnv(gym.Env):
 
         return PointFeatureResult(reachable_indices=sorted(reachable_indices))
 
-    def _compute_dispatch_epsilon(self) -> float:
-        """根据训练进度动态调整调度阶段的epsilon - 使用更平滑的衰减"""
-        progress = np.clip(self.training_progress, 0.0, 1.0)
-        return 1.0 - np.sqrt(progress)
-
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
         """执行一步环境交互"""
         # 动作模式
@@ -551,20 +500,14 @@ class EdgeEnv(gym.Env):
             mode = int(action)
         mode = int(np.clip(mode, 0, 3))
 
-        dispatch_epsilon = self._compute_dispatch_epsilon()
-
         # 1. 执行MCS调度（仅调度空闲MCS）
-        if mode == 0:
-            matching = self._select_patrol_targets()
-        else:
-            action_scores = self._build_mode_scores(mode)
-            matching = self.matcher.match_mcs_to_points_topk(
-                self.mcs_list,
-                self.dispatch_points,
-                action_scores,
-                self.np_random,
-                epsilon=dispatch_epsilon
-            )
+        action_scores = self._build_mode_scores(mode)
+        matching = self.matcher.match_mcs_to_points(
+            self.mcs_list,
+            self.dispatch_points,
+            action_scores,
+            self.np_random
+        )
 
         for mcs_idx, point_idx in matching.items():
             mcs = self.mcs_list[mcs_idx]
