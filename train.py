@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from torch.distributions import Categorical
 from typing import List, Tuple, Dict
 from collections import deque
 import os
@@ -151,14 +152,14 @@ class PPOTrainer:
         self.rewards = []
         self.values = []
         self.dones = []
-        self.log_probs = []  # 虽然是连续动作，但我们记录为参考
+        self.log_probs = []
 
     def select_action(self, state, reachable_mask=None, deterministic=False):
         """
         选择动作
 
         Returns:
-            action_scores: 动作分数
+            action: 动作
             value: 状态价值
         """
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
@@ -168,18 +169,30 @@ class PPOTrainer:
                 state_tensor, reachable_mask, deterministic
             )
 
-        action_scores = action_scores.squeeze(0).cpu().numpy()
+        logits = action_scores.squeeze(0)
+
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+            log_prob = torch.zeros_like(action, dtype=torch.float32)
+        else:
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
+        action = action.cpu().item()
+        log_prob = log_prob.cpu().item()
         value = value.item()
 
-        return action_scores, value
+        return action, value, log_prob
 
-    def store_transition(self, state, action, reward, value, done):
+    def store_transition(self, state, action, reward, value, done, log_prob):
         """存储转换"""
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
         self.values.append(value)
         self.dones.append(done)
+        self.log_probs.append(log_prob)
 
     def compute_gae(self, next_value):
         """
@@ -231,17 +244,14 @@ class PPOTrainer:
 
         # 转换为tensor
         states = torch.FloatTensor(np.array(self.states)).to(self.device)
-        actions = torch.FloatTensor(np.array(self.actions)).to(self.device)
+        actions = torch.LongTensor(np.array(self.actions)).to(self.device)
         old_values = torch.FloatTensor(self.values).to(self.device)
         advantages = torch.FloatTensor(advantages).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
+        old_log_probs = torch.FloatTensor(self.log_probs).to(self.device)
 
         # 标准化优势
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # 存储旧的动作分数用于计算KL散度
-        with torch.no_grad():
-            old_action_scores, _ = self.network(states)
 
         # 多轮更新
         total_policy_loss = 0
@@ -265,17 +275,19 @@ class PPOTrainer:
                 batch_old_values = old_values[batch_indices]
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
-                batch_old_scores = old_action_scores[batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
 
                 # 前向传播
                 action_scores, values = self.network(batch_states)
                 values = values.squeeze(-1)
+                dist = Categorical(logits=action_scores)
+                log_probs = dist.log_prob(batch_actions)
 
-                # 策略损失 (使用MSE作为代理)
-                # 对于连续动作，我们直接优化动作分数与优势的对齐
-                policy_loss = -torch.mean(
-                    torch.sum(action_scores * batch_advantages.unsqueeze(-1), dim=-1)
-                )
+                # 策略损失 (PPO剪切比率)
+                ratios = torch.exp(log_probs - batch_old_log_probs)
+                surr1 = ratios * batch_advantages
+                surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+                policy_loss = -torch.mean(torch.min(surr1, surr2))
 
                 # 值函数损失
                 value_pred_clipped = batch_old_values + torch.clamp(
@@ -288,7 +300,7 @@ class PPOTrainer:
                 value_loss = 0.5 * torch.mean(torch.max(value_loss1, value_loss2))
 
                 # 熵正则化（鼓励探索）
-                entropy = torch.mean(torch.std(action_scores, dim=-1))
+                entropy = dist.entropy().mean()
                 entropy_loss = -entropy
 
                 # 总损失
@@ -393,7 +405,7 @@ def train_ppo(
         env.seed(seed)
 
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
 
     print(f"✓ 状态维度: {state_dim}")
     print(f"✓ 动作维度: {action_dim}")
@@ -448,13 +460,13 @@ def train_ppo(
                 reachable_mask[point_result.reachable_indices] = True
 
             # 选择动作
-            action, value = trainer.select_action(state, reachable_mask)
+            action, value, log_prob = trainer.select_action(state, reachable_mask)
 
             # 执行动作
             next_state, reward, done, info = env.step(action)
 
             # 存储转换
-            trainer.store_transition(state, action, reward, value, done)
+            trainer.store_transition(state, action, reward, value, done, log_prob)
 
             episode_reward += reward
             episode_steps += 1
@@ -580,7 +592,7 @@ def evaluate_ppo(
     env = EdgeEnv(region_id=region_id, factory=factory, max_steps=max_steps)
 
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
 
     # 加载模型
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -607,7 +619,7 @@ def evaluate_ppo(
                 reachable_mask[point_result.reachable_indices] = True
 
             # 确定性动作
-            action, _ = trainer.select_action(state, reachable_mask, deterministic=True)
+            action, value, log_prob = trainer.select_action(state, reachable_mask, deterministic=True)
 
             state, reward, done, info = env.step(action)
             episode_reward += reward

@@ -26,7 +26,7 @@ class CloudPPOTrainer:
         self.device = device
 
         obs_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.shape[0]
+        action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
 
         self.model = ActorCritic(obs_dim, action_dim).to(device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
@@ -190,7 +190,7 @@ def train_hierarchical_cloud(
     for region_id in range(num_regions):
         temp_env = EdgeEnv(region_id, factory, max_steps)
         edge_state_dim = temp_env.observation_space.shape[0]
-        edge_action_dim = temp_env.action_space.shape[0]
+        edge_action_dim = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
         region_dict.append({
             'state_dim': edge_state_dim,
             'action_dim': edge_action_dim,
@@ -409,7 +409,7 @@ def evaluate_cloud_model(
     for region_id in range(18):
         temp_env = EdgeEnv(region_id, factory, max_steps)
         edge_state_dim = temp_env.observation_space.shape[0]
-        edge_action_dim = temp_env.action_space.shape[0]
+        edge_action_dim = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
         region_dict.append(
             {
                 'state_dim': edge_state_dim,
@@ -425,7 +425,7 @@ def evaluate_cloud_model(
 
     # 加载云端模型
     obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n if hasattr(env.action_space, "n") else env.action_space.shape[0]
     model = ActorCritic(obs_dim, action_dim).to(device)
 
     checkpoint = torch.load(model_path, map_location=device)
