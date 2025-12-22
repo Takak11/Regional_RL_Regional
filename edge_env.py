@@ -335,6 +335,7 @@ class EdgeEnv(gym.Env):
         self.num_dispatch_points = len(self.dispatch_points)
         self._last_served = 0
         self._last_failed = 0
+        self._last_distance = 0.0
         self.matcher = MCSMatcher()
 
         self.point_ema = np.zeros(len(self.dispatch_points))  # shape = (20,)
@@ -916,12 +917,19 @@ class EdgeEnv(gym.Env):
             idle_ratio = num_idle / max(self.num_mcs, 1)
             idle_penalty = 0.2 * idle_ratio
 
+        # 移动惩罚：本步新增移动距离
+        total_distance = sum(mcs.total_distance_traveled for mcs in self.mcs_list)
+        step_distance = total_distance - self._last_distance
+        self._last_distance = total_distance
+        move_penalty = 0.05 * step_distance
+
         raw_reward = (
                 service_reward
                 - failure_penalty
                 - wait_penalty
                 - gap_penalty
                 - idle_penalty
+                - move_penalty
                 + success_bonus
         )
 
@@ -955,6 +963,7 @@ class EdgeEnv(gym.Env):
         self.served_ev_ids = set()
         self._last_served = 0
         self._last_failed = 0
+        self._last_distance = 0.0
 
         # 重置平滑缓冲区
         self.reward_buffer.clear()
