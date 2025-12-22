@@ -495,6 +495,8 @@ class EdgeEnv(gym.Env):
 
         self.point_ema = np.zeros(len(self.dispatch_points))  # shape = (20,)
         self.point_count = np.zeros(len(self.dispatch_points))  # 当前 step 的请求计数
+        self.nearby_mcs_count = np.zeros(len(self.dispatch_points))  # 供给能力的EMA统计
+        self.cluster_count = np.zeros(len(self.dispatch_points))
 
         # 观察空间: 在第一次 reset 后根据实际状态长度确定
         self.grid_size = 10
@@ -988,6 +990,25 @@ class EdgeEnv(gym.Env):
                 alpha * self.point_count
                 + (1 - alpha) * self.point_ema
         )
+
+        # 供给能力：当前点2km范围内MCS数量
+        supply_counts = np.zeros_like(self.nearby_mcs_count)
+
+        for idx, point in enumerate(self.dispatch_points):
+            for mcs in self.mcs_list:
+                distance = haversine_distance(
+                    point['latitude'], point['longitude'],
+                    mcs.current_location[1], mcs.current_location[0]
+                )
+                if distance <= 2.0:
+                    supply_counts[idx] += 1
+
+        self.nearby_mcs_count = (
+                alpha * supply_counts
+                + (1 - alpha) * self.nearby_mcs_count
+        )
+        # cluster_count 暂时与供给能力保持一致，防止空值使用
+        self.cluster_count = self.nearby_mcs_count.copy()
         self.point_count[:] = 0  # 清空，准备下一个 step
 
     def score_point(self, p):
@@ -1128,6 +1149,12 @@ class EdgeEnv(gym.Env):
         # ===== 新增：重置状态构建器和追踪器 =====
         self.state_builder.reset()
         self.dispatch_tracker.reset()
+
+        # 重置EMA相关统计
+        self.point_ema[:] = 0
+        self.point_count[:] = 0
+        self.nearby_mcs_count[:] = 0
+        self.cluster_count[:] = 0
 
         return self._get_obs()
 
