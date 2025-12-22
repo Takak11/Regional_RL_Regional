@@ -260,7 +260,7 @@ def train_single_region_with_monitoring(
         # 获取维度
         temp_env, _ = data_manager.create_env(region_id, max_steps, 0)
         state_dim = temp_env.observation_space.shape[0]
-        action_dim = temp_env.action_space.shape[0]
+        action_dim = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
 
         # 创建训练器
         trainer = PPOTrainer(
